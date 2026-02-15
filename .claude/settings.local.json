@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(/opt/homebrew/Cellar/python@3.11/3.11.11/Frameworks/Python.framework/Versions/3.11/Resources/Python.app/Contents/MacOS/Python -m pip install:*)",
+      "Bash(chmod:*)",
+      "Bash(python3:*)",
+      "Bash(pip install:*)",
+      "WebSearch",
+      "Bash(curl:*)",
+      "Bash(ls:*)",
+      "Bash(source:*)",
+      "Bash(python:*)",
+      "Bash(ollama list:*)",
+      "Bash(pip uninstall:*)",
+      "Bash(ollama pull:*)",
+      "Bash(wc:*)",
+      "Bash(du -sh:*)"
+    ]
+  }
+}

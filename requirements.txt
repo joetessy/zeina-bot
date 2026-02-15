@@ -1,0 +1,17 @@
+openai-whisper
+ollama
+sounddevice
+soundfile
+numpy
+pynput
+piper-tts
+torch
+torchaudio
+silero-vad
+pygame
+rich
+ddgs
+pytz
+requests
+python-dotenv
+kivy
