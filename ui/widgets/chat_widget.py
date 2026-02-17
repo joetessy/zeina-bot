@@ -9,12 +9,12 @@ from kivy.uix.anchorlayout import AnchorLayout
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.label import Label
 from kivy.uix.textinput import TextInput
-from kivy.graphics import Color, RoundedRectangle, Rectangle
+from kivy.graphics import Color, RoundedRectangle, Rectangle, Line
 from kivy.clock import Clock
 import threading
 
 
-# Modern dark palette, teal accent to match BMO theme
+# Modern dark palette, teal accent
 BUBBLE_COLORS = {
     "user": (0.11, 0.44, 0.40, 0.92),       # Teal accent
     "assistant": (0.12, 0.13, 0.17, 0.92),   # Cool dark
@@ -54,10 +54,10 @@ class MessageBubble(BoxLayout):
         txt_color = TEXT_COLORS.get(role, TEXT_COLORS["assistant"])
         radii = BUBBLE_RADII.get(role, [16, 16, 16, 16])
 
-        self.padding = [14, 8, 14, 8]
+        self.padding = [16, 10, 16, 10]
 
         with self.canvas.before:
-            Color(*bg_color)
+            self._bg_color_instr = Color(*bg_color)
             self._bg = RoundedRectangle(pos=self.pos, size=self.size, radius=radii)
         self.bind(pos=self._update_bg, size=self._update_bg)
 
@@ -74,6 +74,13 @@ class MessageBubble(BoxLayout):
         self._label.bind(texture_size=self._on_texture_size)
         self.add_widget(self._label)
         self.bind(width=self._update_text_width)
+
+    def update_theme(self):
+        """Re-apply current global BUBBLE_COLORS/TEXT_COLORS to this bubble."""
+        bg_color = BUBBLE_COLORS.get(self._role, BUBBLE_COLORS["assistant"])
+        txt_color = TEXT_COLORS.get(self._role, TEXT_COLORS["assistant"])
+        self._bg_color_instr.rgba = bg_color
+        self._label.color = txt_color
 
     def _update_bg(self, *args):
         self._bg.pos = self.pos
@@ -125,7 +132,7 @@ class ChatWidget(BoxLayout):
             orientation='vertical',
             size_hint_y=None,
             spacing=12,
-            padding=[8, 12],
+            padding=[8, 12, 8, 16],
         )
         self._message_box.bind(minimum_height=self._message_box.setter('height'))
         self._message_box.bind(minimum_height=self._on_content_changed)
@@ -142,14 +149,15 @@ class ChatWidget(BoxLayout):
         self._message_box.bind(height=self._sync_anchor_height)
         self.add_widget(self._scroll)
 
-        # Input container with background and padding (shown in chat mode)
+        # Input container with rounded styling (opacity=0 when hidden so canvas doesn't bleed)
         self._input_container = BoxLayout(
             size_hint_y=None,
             height=0,
-            padding=[12, 8, 12, 10],
+            opacity=0,
+            padding=[16, 12, 16, 14],
         )
         with self._input_container.canvas.before:
-            Color(0.1, 0.1, 0.12, 0.95)
+            Color(0, 0, 0, 0)
             self._input_bg = Rectangle(
                 pos=self._input_container.pos,
                 size=self._input_container.size,
@@ -159,21 +167,56 @@ class ChatWidget(BoxLayout):
             size=self._update_input_bg,
         )
 
-        # Text input field
-        self._input = TextInput(
-            hint_text="Type a message...",
+        # Rounded wrapper for the text input
+        self._input_wrapper = BoxLayout(
             size_hint_y=None,
-            height=52,
+            height=58,
+            padding=[0, 0, 0, 0],
+        )
+        with self._input_wrapper.canvas.before:
+            self._input_wrapper_color = Color(0.14, 0.16, 0.20, 1)
+            self._input_wrapper_bg = RoundedRectangle(
+                pos=self._input_wrapper.pos,
+                size=self._input_wrapper.size,
+                radius=[29],
+            )
+        # Focus ring — drawn after the background fill
+        with self._input_wrapper.canvas.after:
+            self._focus_ring_color = Color(0.3, 0.85, 0.7, 0.18)  # subtle idle border
+            self._focus_ring = Line(
+                rounded_rectangle=(
+                    self._input_wrapper.x, self._input_wrapper.y,
+                    self._input_wrapper.width, self._input_wrapper.height, 29,
+                ),
+                width=1.5,
+            )
+        self._input_wrapper.bind(
+            pos=self._update_wrapper_bg,
+            size=self._update_wrapper_bg,
+        )
+
+        # Text input field (transparent bg so wrapper shows)
+        self._input = TextInput(
+            hint_text="Enter message...",
+            size_hint_y=None,
+            height=58,
             multiline=False,
-            background_color=(0.16, 0.18, 0.22, 1),
+            background_color=(0, 0, 0, 0),
+            background_normal='',
             foreground_color=(0.92, 0.94, 0.96, 1),
-            hint_text_color=(0.45, 0.48, 0.52, 0.8),
+            hint_text_color=(0.40, 0.43, 0.48, 0.9),
             cursor_color=(0.3, 0.85, 0.7, 1),
-            padding=[14, 6, 14, 6],
-            font_size='16sp',
+            padding=[22, 10, 22, 10],
+            font_size='15sp',
         )
         self._input.bind(on_text_validate=self._on_submit)
+        self._input.bind(focus=self._on_input_focus)
+        self._input_wrapper.add_widget(self._input)
+        self._input_container.add_widget(self._input_wrapper)
         self.add_widget(self._input_container)
+
+        # Active streaming bubble (set by begin_assistant_stream, cleared on next stream)
+        self._stream_bubble = None
 
         # Threading for blocking get_chat_input
         self._input_event = threading.Event()
@@ -181,32 +224,51 @@ class ChatWidget(BoxLayout):
         self._waiting_for_input = False
         self._input_cancelled = False
 
+        # Theme state — updated by apply_theme, used in focus handler
+        self._current_font_name = "Roboto"
+        self._input_bg_unfocused = (0.14, 0.16, 0.20, 1)
+        self._input_bg_focused = (0.17, 0.20, 0.26, 1)
+
     def _update_input_bg(self, *args):
         self._input_bg.pos = self._input_container.pos
         self._input_bg.size = self._input_container.size
 
+    def _update_wrapper_bg(self, *args):
+        self._input_wrapper_bg.pos = self._input_wrapper.pos
+        self._input_wrapper_bg.size = self._input_wrapper.size
+        x, y = self._input_wrapper.pos
+        w, h = self._input_wrapper.size
+        self._focus_ring.rounded_rectangle = (x, y, w, h, 29)
+
+    def _on_input_focus(self, instance, focused):
+        if focused:
+            self._focus_ring_color.a = 0.65
+            self._input_wrapper_color.rgba = self._input_bg_focused
+        else:
+            self._focus_ring_color.a = 0
+            self._input_wrapper_color.rgba = self._input_bg_unfocused
+
     def show_input(self):
         """Show the text input field."""
-        self._input_container.height = 70
-        if self._input.parent != self._input_container:
-            if self._input.parent:
-                self._input.parent.remove_widget(self._input)
-            self._input_container.add_widget(self._input)
+        self._input_container.opacity = 1
+        self._input_container.height = 84
         # If stream is hidden, resize to fit just the input
         if self._scroll.opacity == 0:
             self.size_hint_y = None
-            self.height = 70
+            self.height = 84
+        Clock.schedule_once(lambda dt: self.do_layout(), 0)
+        Clock.schedule_once(lambda dt: self._do_scroll_bottom(None), 0.05)
         Clock.schedule_once(lambda dt: setattr(self._input, 'focus', True), 0.1)
 
     def hide_input(self):
         """Hide the text input field."""
+        self._input_container.opacity = 0
         self._input_container.height = 0
-        if self._input.parent == self._input_container:
-            self._input_container.remove_widget(self._input)
         # If stream is also hidden, collapse completely
         if self._scroll.opacity == 0:
             self.size_hint_y = None
             self.height = 0
+        Clock.schedule_once(lambda dt: self.do_layout(), 0)
 
     def _on_submit(self, instance):
         text = instance.text.strip()
@@ -228,6 +290,7 @@ class ChatWidget(BoxLayout):
         """Add a messenger-style bubble to the chat. Thread-safe via Clock."""
         def _add(dt):
             bubble = MessageBubble(text=text, role=role)
+            bubble._label.font_name = self._current_font_name
 
             # Wrap in an anchor row for left/right alignment
             row = _BubbleRow(role=role)
@@ -279,7 +342,8 @@ class ChatWidget(BoxLayout):
         self._input_cancelled = False
 
         Clock.schedule_once(lambda dt: self.show_input(), 0)
-        Clock.schedule_once(lambda dt: setattr(self._input, 'hint_text', prompt), 0)
+        Clock.schedule_once(lambda dt: setattr(self._input, 'hint_text',
+                            prompt or "Enter message..."), 0)
 
         self._input_event.wait()
         self._waiting_for_input = False
@@ -308,8 +372,79 @@ class ChatWidget(BoxLayout):
             self.size_hint_y = None
             self.height = self._input_container.height
 
+    def begin_assistant_stream(self) -> None:
+        """Create an empty assistant bubble. Subsequent append_stream_token calls fill it."""
+        self._stream_bubble = None
+        self._stick_to_bottom = True
+
+        def _add(dt):
+            bubble = MessageBubble(text="", role="assistant")
+            bubble._label.font_name = self._current_font_name
+            row = _BubbleRow(role="assistant")
+            bubble.size_hint_x = BUBBLE_MAX_WIDTH
+            row.add_widget(bubble)
+            bubble.bind(height=lambda inst, h: setattr(row, 'height', h))
+            self._message_box.add_widget(row)
+            self._stream_bubble = bubble
+
+        Clock.schedule_once(_add, 0)
+
+    def append_stream_token(self, token: str) -> None:
+        """Append token text to the active streaming bubble. Thread-safe."""
+        def _update(dt):
+            if self._stream_bubble is not None:
+                self._stream_bubble._label.text += token
+        Clock.schedule_once(_update, 0)
+
     def clear_messages(self):
         """Remove all message bubbles."""
         def _clear(dt):
             self._message_box.clear_widgets()
         Clock.schedule_once(_clear, 0)
+
+    def apply_theme(self, theme_dict):
+        """Update colors from a theme dict, including all existing bubbles."""
+        global BUBBLE_COLORS, TEXT_COLORS
+        BUBBLE_COLORS = {
+            "user": theme_dict.get("bubble_user", BUBBLE_COLORS["user"]),
+            "assistant": theme_dict.get("bubble_assistant", BUBBLE_COLORS["assistant"]),
+            "info": theme_dict.get("bubble_info", BUBBLE_COLORS["info"]),
+            "error": theme_dict.get("bubble_error", BUBBLE_COLORS["error"]),
+        }
+        TEXT_COLORS = {
+            "user": theme_dict.get("text_user", TEXT_COLORS["user"]),
+            "assistant": theme_dict.get("text_assistant", TEXT_COLORS["assistant"]),
+            "info": theme_dict.get("text_info", TEXT_COLORS["info"]),
+            "error": theme_dict.get("text_error", TEXT_COLORS["error"]),
+        }
+        # Update font and store for future bubbles
+        font_name = theme_dict.get("font_name", "Roboto")
+        self._current_font_name = font_name
+
+        # Update input wrapper bg — store for focus handler
+        input_bg = theme_dict.get("chat_input_bg", (0.14, 0.16, 0.20, 1))
+        input_text = theme_dict.get("chat_input_text", (0.92, 0.94, 0.96, 1))
+        self._input_bg_unfocused = input_bg
+        # Focused bg: slightly brighter version of input bg
+        self._input_bg_focused = tuple(min(1.0, c * 1.3) for c in input_bg[:3]) + (1.0,)
+        self._input_wrapper_color.rgba = input_bg
+        self._input.foreground_color = input_text
+        self._input.font_name = font_name
+
+        # Update focus ring and cursor to match accent color
+        accent = theme_dict.get("accent", (0.3, 0.85, 0.7, 1))
+        self._focus_ring_color.r = accent[0]
+        self._focus_ring_color.g = accent[1]
+        self._focus_ring_color.b = accent[2]
+        self._input.cursor_color = (accent[0], accent[1], accent[2], 1)
+
+        # Update scroll bar colors
+        self._scroll.bar_color = (accent[0], accent[1], accent[2], 0.35)
+        self._scroll.bar_inactive_color = (accent[0], accent[1], accent[2], 0.15)
+
+        # Update all existing message bubbles
+        for row in self._message_box.children:
+            for child in row.children:
+                if isinstance(child, MessageBubble):
+                    child.update_theme()
+                    child._label.font_name = font_name

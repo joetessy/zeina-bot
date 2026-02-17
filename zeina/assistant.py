@@ -11,9 +11,11 @@ import threading
 import sys
 import os
 import time
+import json
+import re
+import queue as _queue
 from typing import Optional
 from datetime import datetime
-import json
 import torch
 import readline  # Provides robust line editing
 from collections import deque
@@ -23,22 +25,32 @@ from zeina.enums import InteractionMode, RecordingState
 from zeina.display import Display
 from zeina.audio import AudioRecorder
 from zeina.tts import TTSEngine
-from zeina.tools import tool_manager
+from zeina.tools import tool_manager, set_memory_callback
+
+# Observability rank map (higher = more verbose)
+_OBS_RANK = {"off": 0, "lite": 1, "verbose": 2}
 
 
 class ZeinaAssistant:
     """Main assistant orchestrator"""
 
     # Status message constants
-    VOICE_MODE_READY_STATUS = "Press SPACE to talk"
-    CHAT_MODE_READY_STATUS = "Type your message"
+    VOICE_MODE_READY_STATUS = "Push to talk"
+    CHAT_MODE_READY_STATUS = "Enter a message"
     PROCESSING_STATUS = "Processing..."
-    SPEAKING_STATUS = "Speaking... (press SPACE to interrupt)"
+    SPEAKING_STATUS = "Speaking... (push to interrupt)"
     CHAT_SPEAKING_STATUS = "Speaking..."
 
-    def __init__(self, display=None):
+    def __init__(self, display=None, settings=None):
         # Initialize display first (but don't show anything yet)
         self.display = display or Display()
+        self.settings = settings
+
+        # Wire up memory callback so the `remember` tool writes to the active profile
+        if self.settings:
+            set_memory_callback(
+                lambda fact: self.settings.append_memories(config.ACTIVE_PROFILE, [fact])
+            )
 
         # Show temporary init message
         print("🤖 Initializing Zeina AI Assistant...")
@@ -74,10 +86,35 @@ class ZeinaAssistant:
         # Event log
         self.event_log = deque(maxlen=50)
 
+        # Multi-turn follow-up tracking
+        self._last_turn_had_tool_call = False
+        self._last_tool_used = None
+
+        # Track the most recent memory extraction thread so shutdown can join it
+        self._memory_thread = None  # type: threading.Thread
+
         # Initialize conversation memory
-        self.conversation_history = [
-            {"role": "system", "content": config.SYSTEM_PROMPT}
-        ]
+        self.conversation_history = []
+        if self.settings:
+            self.refresh_system_prompt(reason="startup")
+        else:
+            self.conversation_history.append({"role": "system", "content": config.SYSTEM_PROMPT})
+
+        # Session path for incremental writes (set once per app run)
+        self._session_path: Optional[str] = None
+
+        # Seed history from recent sessions and start a new session file
+        if self.settings and config.SAVE_CONVERSATION_HISTORY:
+            recent = self.settings.load_recent_messages(
+                self.settings.active_profile_name, config.MAX_CONVERSATION_LENGTH
+            )
+            if recent:
+                self.conversation_history.extend(recent)
+            self._session_path = self.settings.start_session(
+                self.settings.active_profile_name
+            )
+            banner = self.settings.get_system_state_banner(self._prompt_runtime_state())
+            self._log_system_state_event(banner, "session start")
 
         # Initialize components
         self._load_models()
@@ -91,7 +128,7 @@ class ZeinaAssistant:
         self.display.show_status_centered(status, style)
 
         # Set initial menu bar values
-        self.display.show_menu_bar(self.mode, config.OLLAMA_MODEL)
+        self.display.show_menu_bar(self.mode, self.settings.get("bot_name", "Zeina") if self.settings else "Zeina")
 
         # Start face display (will clear screen and set up layout with menu bar at top)
         self.display.start_face_display()
@@ -111,6 +148,59 @@ class ZeinaAssistant:
             return self._get_voice_ready_status()
         else:
             return self._get_chat_ready_status()
+
+    def _prompt_runtime_state(self) -> dict:
+        """Values injected into the system prompt for configuration awareness."""
+        if not self.settings:
+            return {}
+        return {
+            "mode": self.mode.value,
+        }
+    def _log_system_state_event(self, banner: str, reason: Optional[str] = None) -> None:
+        """Persist the latest runtime snapshot into the session log."""
+        session_path = getattr(self, "_session_path", None)
+        if not (self.settings and session_path and config.SAVE_CONVERSATION_HISTORY):
+            return
+        entry = reason or "state refresh"
+        self.settings.append_session_event(session_path, entry)
+
+    def _build_llm_messages(self) -> list[dict]:
+        """Return history augmented with the latest runtime state banner."""
+        if not self.conversation_history:
+            return []
+        # If we have no settings, just return the stored history directly
+        if not self.settings:
+            return list(self.conversation_history)
+
+        # Get current system prompt
+        system_prompt = self.settings.get_system_prompt(self._prompt_runtime_state())
+        system_msg = {"role": "system", "content": system_prompt}
+
+        # Get state banner
+        banner = self.settings.get_system_state_banner(self._prompt_runtime_state())
+        state_msg = {"role": "system", "content": banner}
+
+        # Filter out any existing system messages from history
+        non_system_history = [msg for msg in self.conversation_history if msg["role"] != "system"]
+
+        if not non_system_history:
+            # Should not happen, but handle gracefully
+            return [system_msg, state_msg]
+
+        # Insert the runtime state just before the most recent user turn
+        history_prefix = non_system_history[:-1]
+        latest_user = non_system_history[-1]
+        return [system_msg] + history_prefix + [state_msg, latest_user]
+
+    def refresh_system_prompt(self, reason: Optional[str] = None) -> None:
+        """Rebuild the system prompt when runtime configuration changes."""
+        if not self.settings:
+            return
+        runtime_state = self._prompt_runtime_state()
+        banner = self.settings.get_system_state_banner(runtime_state)
+        self._log_system_state_event(banner, reason)
+        if reason:
+            self._obs("lite", f"System prompt updated ({reason})")
 
     def _cleanup_voice_mode(self):
         """Clean up voice mode state when switching away.
@@ -198,28 +288,10 @@ class ZeinaAssistant:
         sys.stdout.flush()
 
     def _save_conversation(self):
-        """Save conversation history to file"""
-        if not config.SAVE_CONVERSATION_HISTORY:
-            return
-
-        # Create conversations directory if it doesn't exist
-        os.makedirs(config.CONVERSATIONS_DIR, exist_ok=True)
-
-        # Generate filename with timestamp
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = os.path.join(config.CONVERSATIONS_DIR, f"conversation_{timestamp}.json")
-
-        # Save conversation history
-        try:
-            with open(filename, 'w') as f:
-                json.dump({
-                    "timestamp": datetime.now().isoformat(),
-                    "model": config.OLLAMA_MODEL,
-                    "messages": self.conversation_history
-                }, f, indent=2)
-            print(f"💾 Conversation saved to {filename}")
-        except Exception as e:
-            print(f"⚠️  Failed to save conversation: {e}")
+        """Wait for any in-flight memory extraction to finish before the app exits."""
+        t = self._memory_thread
+        if t and t.is_alive():
+            t.join(timeout=8)
 
     def _log_event(self, message: str):
         """Record a short event for observability"""
@@ -227,16 +299,22 @@ class ZeinaAssistant:
         self.event_log.append(f"{timestamp} {message}")
 
     def _log_api(self, message: str):
-        """Log an API event to the display's tool log (not chat bubbles)."""
+        """Log an API event to the event log only (no GUI output)."""
         self._log_event(message)
-        if hasattr(self.display, 'show_log'):
-            self.display.show_log(message)
+
+    def _obs(self, level: str, message: str):
+        """Gate-controlled terminal log. Always appends to event_log for diagnostics."""
+        self._log_event(message)
+        current = getattr(config, 'OBSERVABILITY_LEVEL', 'lite')
+        if _OBS_RANK.get(current, 1) >= _OBS_RANK.get(level, 1):
+            ts = time.strftime("%H:%M:%S")
+            print(f"[{ts}] [{level.upper()}] {message}", flush=True)
 
     def _handle_auto_stop(self, reason: str):
         """Called when VAD detects silence or timeout"""
         if self.state == RecordingState.LISTENING:
             if reason == "silence":
-                self._log_event("Auto-stop (silence)")
+                self._obs("verbose", "Auto-stop (silence)")
                 # User stopped speaking - process the recording
                 self.set_state(RecordingState.PROCESSING, "Auto-stopped", "green")
                 threading.Thread(
@@ -244,7 +322,7 @@ class ZeinaAssistant:
                     daemon=True
                 ).start()
             elif reason == "timeout":
-                self._log_event("Auto-stop (timeout)")
+                self._obs("verbose", "Auto-stop (timeout)")
                 # No speech detected - return to idle
                 self.audio_recorder.stop()
                 self.set_state(RecordingState.IDLE, "No speech detected", "red")
@@ -419,7 +497,8 @@ class ZeinaAssistant:
                 # Switch to CHAT mode
                 self._cleanup_voice_mode()
                 self.mode = InteractionMode.CHAT
-                self.display.show_menu_bar(self.mode, config.OLLAMA_MODEL)
+                self.refresh_system_prompt(reason="mode→chat")
+                self.display.show_menu_bar(self.mode, self.settings.get("bot_name", "Zeina") if self.settings else "Zeina")
                 self.set_state(RecordingState.IDLE)
                 self.display.start_face_display(clear_screen=False)
                 time.sleep(0.2)
@@ -429,7 +508,8 @@ class ZeinaAssistant:
                 # Switch to VOICE mode
                 self._cleanup_chat_mode()
                 self.mode = InteractionMode.VOICE
-                self.display.show_menu_bar(self.mode, config.OLLAMA_MODEL)
+                self.refresh_system_prompt(reason="mode→voice")
+                self.display.show_menu_bar(self.mode, self.settings.get("bot_name", "Zeina") if self.settings else "Zeina")
                 self.set_state(RecordingState.IDLE)
                 self.display.start_face_display(clear_screen=False)
                 time.sleep(0.2)
@@ -467,6 +547,7 @@ class ZeinaAssistant:
         if was_chat_mode:
             # Temporarily exit chat mode to avoid stdin contention
             self.mode = InteractionMode.VOICE
+            self.refresh_system_prompt(reason="model-select exit chat")
             if self.chat_input_thread and self.chat_input_thread.is_alive():
                 self.chat_input_thread.join(timeout=0.5)
 
@@ -560,14 +641,15 @@ class ZeinaAssistant:
             print(f"\n❌ Error listing models: {e}\n")
         finally:
             # Update menu bar with new model
-            self.display.show_menu_bar(self.mode, config.OLLAMA_MODEL)
+            self.display.show_menu_bar(self.mode, self.settings.get("bot_name", "Zeina") if self.settings else "Zeina")
             # Restart face animation and UI
             self.display.start_face_display()
             # Show appropriate prompt based on mode
             time.sleep(0.1)  # Let face render
             if was_chat_mode:
                 self.mode = InteractionMode.CHAT
-                self.display.show_menu_bar(self.mode, config.OLLAMA_MODEL)
+                self.refresh_system_prompt(reason="model-select resume chat")
+                self.display.show_menu_bar(self.mode, self.settings.get("bot_name", "Zeina") if self.settings else "Zeina")
                 self.set_state(RecordingState.IDLE)
                 print("─" * 80)
                 self.chat_input_thread = threading.Thread(target=self._chat_input_loop, daemon=True)
@@ -580,17 +662,15 @@ class ZeinaAssistant:
         if not user_message.strip():
             return
         try:
+            self._obs("lite", f"User: {user_message}")
             # Show what user said in a panel
             self.display.show_user_message(user_message)
 
             # Show processing status in chat mode
             self.set_state(RecordingState.PROCESSING, self.PROCESSING_STATUS, "magenta")
 
-            # Get LLM response
+            # Get LLM response (display is handled inside _get_llm_response)
             assistant_response = self._get_llm_response(user_message, show_detail=False)
-
-            # Show assistant response in the feed
-            self.display.show_assistant_message(assistant_response)
 
             # Speak if the speaking toggle is on (defaults to False in chat;
             # terminal Display has no toggles so this block is skipped)
@@ -599,6 +679,7 @@ class ZeinaAssistant:
                 self.display.show_status_centered(self.CHAT_SPEAKING_STATUS, "blue")
                 self.is_speaking = True
                 self.display.update_face_state(self.state, self.is_speaking)
+                self._obs("lite", f"Speaking: {assistant_response}")
                 self.tts_engine.speak(assistant_response)
                 self.is_speaking = False
                 self.display.update_face_state(self.state, self.is_speaking)
@@ -620,7 +701,7 @@ class ZeinaAssistant:
             self.audio_recorder.stop()
             self.audio_recorder.start()
 
-            self._log_event(f"Listening started ({mode})")
+            self._obs("verbose", f"Listening started ({mode})")
             self.state = RecordingState.LISTENING
 
             # Update face
@@ -649,9 +730,36 @@ class ZeinaAssistant:
 
         Uses a fast, focused classification call separate from the main conversation
         so the model never leaks tool reasoning into its response.
+
+        If the previous turn already retrieved data via a tool, that context is
+        included so the classifier can judge whether the user is following up on
+        existing data (→ none) or genuinely requesting something new (→ tool).
         """
+        # Quick keyword-based overrides for common cases
+        message_lower = message.lower()
+        
+
+        # Force get_system_health for working directory queries
+        if any(keyword in message_lower for keyword in [
+            'working directory', 'current directory', 'what directory', 'current path', 'pwd',
+            'where is the app', 'application location', 'source code location',
+            'program directory', 'app directory', 'system health', 'where are you located',
+        ]):
+            return 'get_system_health'
+        
+
         tool_names = list(tool_manager.tools.keys())
         tool_list = ", ".join(tool_names)
+
+        prior_context = ""
+        if self._last_turn_had_tool_call and self._last_tool_used:
+            prior_context = (
+                f"CONTEXT: The previous turn already retrieved data using '{self._last_tool_used}' "
+                f"and that data is already in the conversation history. "
+                f"Only pick a tool if the user is clearly asking for NEW or DIFFERENT information "
+                f"not covered by the existing data. If this looks like a follow-up question "
+                f"about the same topic, pick 'none'.\n\n"
+            )
 
         classifier_model = getattr(config, 'INTENT_CLASSIFIER_MODEL', config.OLLAMA_MODEL)
         response = ollama.chat(
@@ -659,18 +767,45 @@ class ZeinaAssistant:
             messages=[{
                 "role": "user",
                 "content": (
+                    f"{prior_context}"
                     f"You are a router. Given the user message below, decide which tool "
-                    f"is needed. Available tools: {tool_list}\n"
+                    f"is needed. User may refer to the computer as you/we/our. Available tools: {tool_list}\n"
                     f"Rules:\n"
                     f"- web_search: ONLY if the user explicitly asks to search/look something up, "
                     f"or needs real-time data (live news, scores, prices). "
                     f"Do NOT pick this for general knowledge, greetings, opinions, feelings, "
-                    f"personal questions, weather, or conversation about prior messages.\n"
-                    f"- get_weather: ONLY if the user asks about weather, temperature, or "
-                    f"forecast for a specific location.\n"
-                    f"- get_current_time: ONLY if the user asks for the current time or date.\n"
-                    f"- calculate: ONLY if the user asks to compute a math expression.\n"
-                    f"- get_location: ONLY if the user asks where they are or their current location.\n"
+                    f"personal questions, or conversation about prior messages. "
+                    f"NEVER use this for weather — always use get_weather instead.\n"
+                    f"- get_system_health: ONLY and ALWAYS when customer asks about computer or system STATE: "
+                    f"disk space, storage, network/wifi status, battery, CPU/RAM usage, memory, operating system info, "
+                    f"current working directory, system uptime, or application location on disk. "
+                    f"  'where am I in the file system?', 'show me the current path'.\n"
+                    f"- get_weather: ONLY if the user asks about EXTERNAL weather conditions, temperature, or "
+                    f"forecast for a specific location OUTSIDE (like city weather). Do NOT use for computer/system temperature.\n"
+                    f"- get_current_time: ONLY if the user asks for the current time or date. (Priority over shell commands)\n"
+                    f"- calculate: ONLY if the user is asking you the answer to a math problem. Do NOT use for questions about the computer.\n"
+                    f"- get_location: ONLY if the user asks where they are or about their geographic locatoin, where they are in the WORLD/CITY. "
+                    f"Keywords: 'where am I', 'what city am I in', 'where am I located'. "
+                    f"Do NOT use for computer working directory or file locations.\n"
+                    f"- read_file: ONLY to read the actual text or code INSIDE a specific file. "
+                    f" Do NOT use this for checking disk space or storage capacity.\n"
+                    f"- list_directory: ONLY to see a list of file names in a folder. "
+                    f"Do NOT use this for checking hardware storage or disk space.\n"
+                    f"- remember: ONLY when the user explicitly asks you to remember, save, or not forget "
+                    f"a specific fact about themselves. Keywords: 'remember that', 'don't forget', 'keep in mind'.\n"
+                    f"- execute_shell: ONLY when the user asks you to run a command, open an application, "
+                    f"execute a script, or perform a system action. "
+                    f"Keywords: 'open', 'run', 'launch', 'execute', 'start', 'kill', 'close the app'. "
+                    f"Do NOT use for asking about the system state (use get_system_health for that).\n"
+                    f"- query_knowledge_base: ONLY when the user explicitly asks to search or look up "
+                    f"something in their saved files/documents/notes on disk. "
+                    f"Keywords: 'my notes', 'what does my document say', 'in my files', 'look in my knowledge base'. "
+                    f"Do NOT use when the user is sharing personal info ('I am X', 'did you know I am X'), "
+                    f"asking general questions, or having a normal conversation.\n"
+                    f"- read_clipboard: ONLY when the user asks to read, show, or check what is in their clipboard. "
+                    f"Keywords: 'what's in my clipboard', 'read my clipboard', 'what did I copy', 'show clipboard'.\n"
+                    f"- write_clipboard: ONLY when the user asks to copy specific text to their clipboard. "
+                    f"Keywords: 'copy to clipboard', 'put X in my clipboard', 'copy that', 'save to clipboard'.\n"
                     f"- none: For everything else. When in doubt, pick none.\n\n"
                     f"User message: \"{message}\"\n\n"
                     f"Reply with ONLY the tool name or \"none\". Nothing else."
@@ -678,8 +813,8 @@ class ZeinaAssistant:
             }],
             options={"temperature": 0}
         )
-        result = response['message'].get('content', 'none').strip().lower()
-        self._log_event(f"Intent [{classifier_model}]: {result}")
+        result = response['message'].get('content', 'none').strip().lower().replace('.', '').replace('"', '')
+        self._obs("lite", f"Intent [{classifier_model}]: {result}")
         # Validate the result is a known tool or none
         if result not in tool_names:
             return "none"
@@ -697,7 +832,109 @@ class ZeinaAssistant:
             return {"location": self._extract_location(user_message)}
         elif tool_name == "get_location":
             return {}
+        elif tool_name == "read_file":
+            return {"path": self._extract_path(user_message)}
+        elif tool_name == "list_directory":
+            return {"path": self._extract_path(user_message)}
+        elif tool_name == "get_system_health":
+            return {}
+        elif tool_name == "remember":
+            return {"fact": self._extract_fact(user_message)}
+        elif tool_name == "execute_shell":
+            return {"command": self._extract_shell_command(user_message)}
+        elif tool_name == "query_knowledge_base":
+            return {"query": user_message}
+        elif tool_name == "read_clipboard":
+            return {}
+        elif tool_name == "write_clipboard":
+            return {"content": self._extract_clipboard_content(user_message)}
         return {}
+
+    def _extract_clipboard_content(self, message: str) -> str:
+        """Use the classifier LLM to extract what the user wants written to the clipboard."""
+        classifier_model = getattr(config, 'INTENT_CLASSIFIER_MODEL', config.OLLAMA_MODEL)
+        response = ollama.chat(
+            model=classifier_model,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Extract exactly what the user wants copied to their clipboard.\n"
+                    f"Return ONLY the text to copy, with no explanation or extra words.\n"
+                    f"Examples:\n"
+                    f"  'copy hello world to my clipboard' → 'hello world'\n"
+                    f"  'put my email address in the clipboard: test@example.com' → 'test@example.com'\n\n"
+                    f"User message: \"{message}\""
+                )
+            }],
+            options={"temperature": 0}
+        )
+        content = response['message'].get('content', '').strip()
+        self._obs("verbose", f"Clipboard content: {content}")
+        return content if content else message
+
+    def _extract_shell_command(self, message: str) -> str:
+        """Use the classifier LLM to extract a shell command from a natural language request."""
+        classifier_model = getattr(config, 'INTENT_CLASSIFIER_MODEL', config.OLLAMA_MODEL)
+        response = ollama.chat(
+            model=classifier_model,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Extract the shell command the user wants to run from this message. "
+                    f"Reply with ONLY the shell command, nothing else. "
+                    f"Use macOS/Linux syntax. For opening apps use 'open -a AppName'. "
+                    f"If the request is ambiguous, produce the most likely shell command.\n\n"
+                    f"Message: \"{message}\""
+                )
+            }],
+            options={"temperature": 0}
+        )
+        command = response['message'].get('content', '').strip()
+        self._obs("verbose", f"Shell command: {command}")
+        return command
+
+    def _extract_fact(self, message: str) -> str:
+        """Extract the fact the user wants remembered from their message."""
+        classifier_model = getattr(config, 'INTENT_CLASSIFIER_MODEL', config.OLLAMA_MODEL)
+        response = ollama.chat(
+            model=classifier_model,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Extract the specific fact the user wants to be remembered from this message. "
+                    f"Rephrase it as a short, clear statement starting with a verb or noun — "
+                    f"NO subject pronoun (not 'she', 'he', 'they', 'the user', 'I'). "
+                    f"Examples: 'prefers dark mode', 'has a dog named Max'. "
+                    f"Reply with ONLY the fact, nothing else.\n\n"
+                    f"Message: \"{message}\""
+                )
+            }],
+            options={"temperature": 0}
+        )
+        fact = response['message'].get('content', message).strip()
+        self._obs("verbose", f"Extracted fact: {fact}")
+        return fact if fact else message
+
+    def _extract_path(self, message: str) -> str:
+        """Use the classifier LLM to extract a file or directory path from a natural language request."""
+        classifier_model = getattr(config, 'INTENT_CLASSIFIER_MODEL', config.OLLAMA_MODEL)
+        response = ollama.chat(
+            model=classifier_model,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Extract the file or directory path from this message. "
+                    f"Use standard macOS/Linux path conventions (e.g. '~/Documents', '~/.zshrc'). "
+                    f"Reply with ONLY the path, nothing else. "
+                    f"If no specific file or folder is mentioned, reply with '~'.\n\n"
+                    f"Message: \"{message}\""
+                )
+            }],
+            options={"temperature": 0}
+        )
+        path = response['message'].get('content', '~').strip() or '~'
+        self._obs("verbose", f"Path: {path}")
+        return path
 
     def _extract_location(self, message: str) -> str:
         """Extract a location name from a user message for weather queries.
@@ -716,10 +953,66 @@ class ZeinaAssistant:
             options={"temperature": 0}
         )
         location = response['message'].get('content', message).strip()
-        self._log_event(f"Location: {location}")
+        self._obs("verbose", f"Location: {location}")
         return location if location else message
 
-    def _get_llm_response(self, user_message: str, show_detail: bool = True) -> str:
+    def _maybe_summarize_history(self) -> None:
+        """Summarize old conversation turns when history grows too long.
+
+        When the history exceeds MAX_CONVERSATION_LENGTH + a small buffer, the
+        oldest turns (excluding the system prompt and the most recent half) are
+        collapsed into a single summary message using the fast classifier model.
+        Falls back to simple truncation if the summarization call fails.
+        """
+        if config.MAX_CONVERSATION_LENGTH <= 0:
+            return
+        # Add a buffer of 4 before triggering so we don't summarize on every turn
+        if len(self.conversation_history) <= config.MAX_CONVERSATION_LENGTH + 4:
+            return
+
+        keep_recent = max(config.MAX_CONVERSATION_LENGTH // 2, 4)
+        # conversation_history[0] is always the system prompt
+        to_summarize = self.conversation_history[1:-keep_recent]
+        recent = self.conversation_history[-keep_recent:]
+
+        if not to_summarize:
+            return
+
+        text = "\n".join(
+            f"{m['role'].upper()}: {m['content'][:300]}"
+            for m in to_summarize
+        )
+        try:
+            classifier_model = getattr(config, 'INTENT_CLASSIFIER_MODEL', config.OLLAMA_MODEL)
+            resp = ollama.chat(
+                model=classifier_model,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        f"Summarize this conversation in 2-3 sentences, preserving key facts, "
+                        f"names, and any decisions made:\n\n{text}"
+                    )
+                }],
+                options={"temperature": 0},
+            )
+            summary = resp['message'].get('content', '').strip()
+            if summary:
+                summary_msg = {
+                    "role": "assistant",
+                    "content": f"[Earlier conversation summary: {summary}]",
+                }
+                self.conversation_history = [self.conversation_history[0], summary_msg] + recent
+                self._obs("lite", f"History summarized: {len(to_summarize)} msgs → 1 summary")
+                return
+        except Exception as e:
+            self._obs("lite", f"Summarization failed ({e}), falling back to truncation")
+
+        # Fallback: plain truncation
+        self.conversation_history = [self.conversation_history[0]] + \
+            self.conversation_history[-(config.MAX_CONVERSATION_LENGTH):]
+
+    def _get_llm_response(self, user_message: str, show_detail: bool = True,
+                          voice_streaming: bool = False) -> str:
         """Get response from Ollama LLM with conversation history and tool calling support"""
         # State is already set by caller (voice or chat mode)
 
@@ -744,14 +1037,10 @@ class ZeinaAssistant:
                 print(f"  {role}{tool_info}: {content}")
             print()
 
-        # Trim conversation history if it exceeds max length
-        if config.MAX_CONVERSATION_LENGTH > 0:
-            # Keep system prompt + last N messages
-            if len(self.conversation_history) > config.MAX_CONVERSATION_LENGTH + 1:
-                self.conversation_history = [self.conversation_history[0]] + \
-                    self.conversation_history[-(config.MAX_CONVERSATION_LENGTH):]
+        # Summarize or trim conversation history if it exceeds max length
+        self._maybe_summarize_history()
 
-        # Step 1: Classify whether a tool is needed (separate fast LLM call)
+        # Step 1: Classify whether a tool is needed
         tool_needed = "none"
         if tool_manager.has_tools():
             tool_needed = self._classify_tool_intent(user_message)
@@ -763,50 +1052,301 @@ class ZeinaAssistant:
 
             # Build tool arguments from the user message
             tool_args = self._build_tool_args(tool_needed, user_message)
+
             tool_result = tool_manager.execute_tool(tool_needed, tool_args)
-            result_preview = tool_result[:80] + "..." if len(tool_result) > 80 else tool_result
-            self._log_event(f"Tool result: {result_preview}")
+            # verbose shows the full result; lite just confirms it ran
+            self._obs("lite", f"Tool: {tool_needed} → {len(tool_result)} chars")
+            self._obs("verbose", f"Tool result:\n{tool_result}")
 
             # Inject tool result as a follow-up user message so the LLM
             # treats it as context it must respond to directly.
+            # Repeat the original question explicitly so the LLM doesn't lose
+            # track of it when the tool result is long (e.g. ps aux output).
+            injection_content = (
+                f"Data from {tool_needed}:\n{tool_result}\n\n"
+                f"Using the data above, answer this question naturally without mentioning any data source or tool usage: {user_message}"
+            )
+            
             self.conversation_history.append({
                 "role": "user",
-                "content": f"[DATA] {tool_result}\n\nUsing the data above, answer my previous question naturally and concisely."
+                "content": injection_content
             })
+            self._last_turn_had_tool_call = True
+            self._last_tool_used = tool_needed
+        else:
+            self._last_turn_had_tool_call = False
 
         # Step 3: Get the final response (never pass tools schema to avoid leaking)
         msg_count = len(self.conversation_history)
-        self._log_event(f"LLM [{config.OLLAMA_MODEL}] ({msg_count} msgs)")
-        response = ollama.chat(
-            model=config.OLLAMA_MODEL,
-            messages=self.conversation_history
-        )
-        assistant_message = response['message']
-        content = assistant_message.get('content', '').strip()
+        self._obs("lite", f"LLM [{config.OLLAMA_MODEL}] ({msg_count} msgs)")
+        can_stream = getattr(self.display, 'has_streaming', False)
 
-        # Guard against empty responses - retry once without tool context
-        if not content and tool_needed != "none":
-            self._log_event("Empty response after tool - retrying without tool context")
-            # Remove the injected tool context and retry
-            self.conversation_history = [
-                m for m in self.conversation_history
-                if not (m.get('role') == 'user'
-                        and '[DATA]' in m.get('content', ''))
-            ]
-            response = ollama.chat(
-                model=config.OLLAMA_MODEL,
-                messages=self.conversation_history
-            )
-            assistant_message = response['message']
-            content = assistant_message.get('content', '').strip()
+        def _do_llm_call(messages: list[dict], start_bubble: bool = False) -> tuple:
+            """Run one ollama call, streaming tokens to the display if supported.
+            Returns (content_str, elapsed_seconds)."""
+            t0 = time.monotonic()
+            if can_stream:
+                if start_bubble:
+                    self.display.begin_stream()
+                accumulated = ""
+                for chunk in ollama.chat(
+                    model=config.OLLAMA_MODEL,
+                    messages=messages,
+                    stream=True,
+                ):
+                    token = chunk['message'].get('content', '')
+                    if token:
+                        accumulated += token
+                        self.display.stream_token(token)
+                return accumulated.strip(), time.monotonic() - t0
+            else:
+                response = ollama.chat(
+                    model=config.OLLAMA_MODEL,
+                    messages=messages,
+                )
+                return response['message'].get('content', '').strip(), time.monotonic() - t0
+
+        messages_for_call = self._build_llm_messages()
+        if not messages_for_call:
+            messages_for_call = list(self.conversation_history)
+
+        if voice_streaming and hasattr(self, 'tts_engine') and self.tts_engine:
+            # Voice mode: stream tokens to display + speak each sentence as it arrives
+            t0 = time.monotonic()
+            content = self._stream_and_speak(messages_for_call)
+            elapsed = time.monotonic() - t0
+        else:
+            content, elapsed = _do_llm_call(messages_for_call, start_bubble=True)
+
+            # Guard against empty responses - retry once without tool context
+            if not content and tool_needed != "none":
+                self._obs("lite", "Empty response after tool — retrying without tool context")
+                self.conversation_history = [
+                    m for m in self.conversation_history
+                    if not (m.get('role') == 'user'
+                            and '[DATA]' in m.get('content', ''))
+                ]
+                messages_for_call = self._build_llm_messages()
+                if not messages_for_call:
+                    messages_for_call = list(self.conversation_history)
+                content, elapsed = _do_llm_call(messages_for_call, start_bubble=False)
 
         if not content:
             content = "Sorry, I didn't quite get that. Could you try again?"
+            if can_stream:
+                self.display.stream_token(content)
 
-        self.conversation_history.append(assistant_message)
-        self._log_event(f"Response: {len(content)} chars")
+        # Non-streaming path: add the bubble now that we have the full response.
+        if not can_stream:
+            self.display.show_assistant_message(content)
+
+        # Store only role+content — the ollama.Message object (or its model_dump() output)
+        # may carry non-JSON-serializable fields like tool_calls/images. We already
+        # have the clean string in `content`, so there's no need to keep anything else.
+        self.conversation_history.append({"role": "assistant", "content": content})
+        self._obs("lite", f"Response: {len(content)} chars in {elapsed:.1f}s")
+
+        # Persist exchange to session file (incremental; survives crashes)
+        if self.settings and self._session_path and config.SAVE_CONVERSATION_HISTORY:
+            self.settings.append_to_session(self._session_path, user_message, content)
+
+        # Extract user memories asynchronously (never blocks the response pipeline).
+        # daemon=False so the thread survives app shutdown long enough to write;
+        # _save_conversation joins it with a timeout as a safety net.
+        if self.settings and self.settings.get("memory_enabled", True):
+            t = threading.Thread(
+                target=self._extract_memories,
+                args=(user_message, content),
+                daemon=False,
+            )
+            t.start()
+            self._memory_thread = t
 
         return content
+
+    def _extract_memories(self, user_message: str, assistant_response: str) -> None:
+        """Background task: extract memorable personal facts from what the USER said."""
+        _ = assistant_response  # kept for signature compatibility
+        # Skip messages with no first-person markers — a pure question or command
+        # with no "I/my/I'm/I've" cannot contain a self-disclosure.
+        msg_lower = user_message.lower()
+        _first_person = (" i ", " i'm ", " i've ", " i'd ", " i'll ", " my ", " mine ", " myself ")
+        if not any(tok in f" {msg_lower} " for tok in _first_person):
+            return
+
+        try:
+            profile = self.settings.active_profile_name
+            self._obs("lite", f"Memory extraction [{config.OLLAMA_MODEL}]")
+            existing = self.settings.load_memories(profile)
+            existing_block = ""
+            if existing:
+                existing_block = (
+                    "Already known facts:\n"
+                    + "\n".join(f"- {f}" for f in existing)
+                    + "\n\n"
+                )
+
+            response = ollama.chat(
+                model=config.OLLAMA_MODEL,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        "Decide whether the user's message contains a durable self-disclosure, "
+                        "then extract it.\n\n"
+                        "STEP 1 — Guard. Did the user make a direct statement about themselves — "
+                        "their preferences, life, identity, plans, or habits? "
+                        "If the message is a question, a request, a task, or a command, return []. "
+                        "If the content is about someone or something else rather than the user, return [].\n\n"
+                        "STEP 2 — Extract (only if STEP 1 passed). Pull out durable facts:\n"
+                        "  • Preferences & tastes (food, music, hobbies, activities)\n"
+                        "  • Personal details (name, relationships, family, location)\n"
+                        "  • Plans & intentions (trips, goals, purchases)\n"
+                        "  • Routines, habits, lifestyle\n"
+                        "  • Work & education (role, company, skills)\n"
+                        "  • Beliefs, values, identity\n\n"
+                        "Rules:\n"
+                        "- Only extract what the user explicitly stated. No stereotypes or inferences.\n"
+                        "- Rephrase in third person, dropping 'I': store 'likes cheese', not 'I like cheese'.\n"
+                        "- Skip style inferences about how they communicate — extract content, not tone.\n"
+                        "- Skip one-off requests, fleeting tasks, and facts about other people.\n"
+                        "- Skip already-known facts listed below.\n\n"
+                        f"{existing_block}"
+                        f"USER MESSAGE: {user_message}\n\n"
+                        "Respond with ONLY a JSON array of strings. Return [] if nothing qualifies."
+                    )
+                }],
+                options={"temperature": 0},
+            )
+            raw = response['message'].get('content', '[]').strip()
+            self._obs("verbose", f"Memory extraction raw: {raw[:120]}")
+            start = raw.find('[')
+            end = raw.rfind(']')
+            if start == -1 or end == -1:
+                self._obs("lite", "Memory extraction: no JSON array in response")
+                return
+            records = json.loads(raw[start:end + 1])
+            if isinstance(records, list):
+                clean_facts = []
+                for entry in records:
+                    if isinstance(entry, str) and entry.strip():
+                        clean_facts.append(entry.strip())
+                if clean_facts:
+                    self.settings.append_memories(profile, clean_facts)
+                    self._obs("lite", f"Memories stored: {clean_facts}")
+                    # Flash a brief notification in the status bar
+                    preview = clean_facts[0]
+                    if len(preview) > 42:
+                        preview = preview[:42] + "..."
+                    suffix = f" (+{len(clean_facts) - 1} more)" if len(clean_facts) > 1 else ""
+                    self.display.show_log(f"Memory saved: {preview}{suffix}")
+        except Exception as e:
+            self._obs("lite", f"Memory extraction error: {e}")
+
+
+    # Regex that matches a sentence boundary: end of sentence punctuation followed by
+    # whitespace (or newline), or a standalone newline paragraph break.
+    _SENTENCE_END_RE = re.compile(r'(?<=[.!?])\s+|(?<=\n)\s*(?=\S)')
+
+    def _stream_and_speak(self, messages: list) -> str:
+        """Stream an LLM response and speak each sentence as it arrives.
+
+        Architecture:
+          - Main thread: streams tokens from Ollama, buffers until a sentence
+            boundary is detected, then puts the sentence onto sentence_q.
+          - Synthesis thread (daemon): picks sentences from sentence_q, calls
+            tts_engine.synthesize_to_file(), puts the WAV path onto play_q.
+          - Back in main thread (after streaming ends): drains play_q and calls
+            tts_engine.play_file() for each WAV, giving sentence-level latency.
+
+        The synthesis thread runs concurrently with streaming so that the next
+        sentence's audio is ready (or nearly ready) when the current one finishes.
+        """
+        sentence_q: _queue.Queue = _queue.Queue(maxsize=3)
+        play_q: _queue.Queue = _queue.Queue()
+        full_response: list[str] = []
+
+        def _synth_worker():
+            while True:
+                try:
+                    sentence = sentence_q.get(timeout=0.3)
+                    if sentence is None:
+                        break
+                    try:
+                        path = self.tts_engine.synthesize_to_file(sentence)
+                        play_q.put(path)
+                    except Exception as e:
+                        self._obs("lite", f"TTS synthesis error: {e}")
+                    finally:
+                        sentence_q.task_done()
+                except _queue.Empty:
+                    continue
+
+        synth_thread = threading.Thread(target=_synth_worker, daemon=True)
+        synth_thread.start()
+
+        buf = ""
+        can_stream = getattr(self.display, 'has_streaming', False)
+        if can_stream:
+            self.display.begin_stream()
+
+        try:
+            stream = ollama.chat(
+                model=config.OLLAMA_MODEL,
+                messages=messages,
+                stream=True,
+            )
+            for chunk in stream:
+                token = chunk['message'].get('content', '')
+                if not token:
+                    continue
+                buf += token
+                full_response.append(token)
+                if can_stream:
+                    self.display.stream_token(token)
+
+                # Split on sentence boundary; only flush if the sentence is long
+                # enough to avoid fragmenting "e.g." or "Mr." abbreviations.
+                parts = self._SENTENCE_END_RE.split(buf, maxsplit=1)
+                if len(parts) > 1 and len(parts[0].strip()) >= 8:
+                    sentence_q.put(parts[0].strip())
+                    buf = parts[1] if len(parts) > 1 else ""
+        except Exception as e:
+            self._obs("lite", f"Streaming LLM error: {e}")
+
+        # Flush remaining buffer
+        if buf.strip():
+            sentence_q.put(buf.strip())
+
+        # Signal synthesis thread to stop
+        sentence_q.put(None)
+        synth_thread.join(timeout=60)
+
+        # Audio is about to start — only NOW set is_speaking so PTT correctly
+        # triggers an interrupt during playback rather than during LLM computation.
+        self.is_speaking = True
+        self.display.update_face_state(self.state, self.is_speaking)
+
+        # Drain the play queue
+        play_q.put(None)
+        while True:
+            path = play_q.get()
+            if path is None:
+                break
+            if not self._check_interrupted():
+                self.tts_engine.play_file(path)
+            else:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+        return "".join(full_response).strip()
+
+    def _check_interrupted(self) -> bool:
+        """Return True if the user has pressed spacebar to interrupt (is_speaking was cleared)."""
+        # The TTS engine's stop() sets is_speaking=False on the engine; the pipeline
+        # thread's self.is_speaking flag is used as the interrupt signal.
+        return not self.is_speaking
 
     def process_audio_pipeline(self):
         """
@@ -828,7 +1368,7 @@ class ZeinaAssistant:
                 return
 
             # Save to temporary file
-            temp_audio_file = "temp_recording.wav"
+            temp_audio_file = os.path.join(config.TMP_DIR, "temp_recording.wav")
             self._save_audio_to_file(audio_data, temp_audio_file)
 
             # Transcribe
@@ -837,8 +1377,7 @@ class ZeinaAssistant:
                 self.set_state(RecordingState.IDLE)
                 return
 
-            preview = transcription[:50] + "..." if len(transcription) > 50 else transcription
-            self._log_event(f"Transcribed: {preview}")
+            self._obs("lite", f"User: {transcription}")
 
             # Show what user said
             self.display.show_user_message(transcription)
@@ -846,22 +1385,15 @@ class ZeinaAssistant:
             # Show processing status in voice mode
             self.set_state(RecordingState.PROCESSING, self.PROCESSING_STATUS, "magenta")
 
-            # Get LLM response
-            assistant_response = self._get_llm_response(transcription)
-
-            # Show assistant response
-            self.display.show_assistant_message(assistant_response)
-
-            # Speak response if the speaking toggle is on (independent of mode)
+            # Get LLM response, speaking each sentence as it arrives (streaming TTS)
             speaking_enabled = getattr(self.display, 'toggles', {}).get('speaking', True)
-            if speaking_enabled and assistant_response.strip():
-                # Speak response
+            if speaking_enabled and hasattr(self, 'tts_engine') and self.tts_engine:
                 self.display.show_status_centered(self.SPEAKING_STATUS, "blue")
-                self.is_speaking = True
-                self.display.update_face_state(self.state, self.is_speaking)
-                self.tts_engine.speak(assistant_response)
+                assistant_response = self._get_llm_response(transcription, voice_streaming=True)
                 self.is_speaking = False
                 self.display.update_face_state(self.state, self.is_speaking)
+            else:
+                assistant_response = self._get_llm_response(transcription)
 
             # Reset state after response (do not override active listening)
             # Check state without holding lock to avoid deadlock with set_state
@@ -870,7 +1402,6 @@ class ZeinaAssistant:
 
             # Auto-listen for follow-up question (only in voice mode)
             if self.mode == InteractionMode.VOICE and not self.audio_recorder.is_recording:
-                print()  # Blank line
                 self.start_listening(mode="auto")
 
         except Exception as e:
@@ -928,7 +1459,7 @@ class ZeinaAssistant:
             is_activation_key = False
 
             if hasattr(key, 'char') and key.char == config.PUSH_TO_TALK_KEY:
-                is_activation_key = True
+                    is_activation_key = True
             elif key == keyboard.Key.space and config.PUSH_TO_TALK_KEY == "space":
                 is_activation_key = True
 

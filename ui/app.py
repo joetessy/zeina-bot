@@ -10,21 +10,27 @@ from kivy.app import App
 from kivy.core.window import Window
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.floatlayout import FloatLayout
+from kivy.uix.anchorlayout import AnchorLayout
 from kivy.uix.popup import Popup
 from kivy.uix.button import Button
-from kivy.uix.scrollview import ScrollView
 from kivy.uix.label import Label
+from kivy.uix.scrollview import ScrollView
+from kivy.uix.dropdown import DropDown
 from kivy.clock import Clock
 from kivy.graphics import Color, RoundedRectangle
 
 from zeina import config
 from zeina.enums import InteractionMode, RecordingState
+from zeina.settings import Settings
 
 from ui.widgets.face_widget import FaceWidget
 from ui.widgets.status_widget import StatusWidget
 from ui.widgets.chat_widget import ChatWidget
-from ui.widgets.toggle_panel import TogglePanel
+from ui.widgets.settings_screen import SettingsScreen
+from ui.widgets.diagnostics_widget import DiagnosticsWidget
 from ui.kivy_display import KivyDisplay
+from ui.themes import ThemeManager
+from ui.icons import register_icon_font, register_mono_font, icon, ICONS
 
 
 class ZeinaApp(App):
@@ -37,15 +43,31 @@ class ZeinaApp(App):
 
         self._assistant = None
         self._stream = None
-        self._panel_visible = True
+        self._tts_muted = False
+        self._chat_visible = False
+        self._status_visible = True   # Status bar visibility (toggled by eye button)
+        self._chat_loop_id = 0        # Incremented each time a new chat loop starts
+        self._quitting = False        # Guard against re-entrant shutdown
 
-        # Float layout so we can overlay the settings button
+        # Register icon font
+        self._has_icons = register_icon_font()
+        register_mono_font()
+
+        # Initialize settings and apply to config
+        self._settings = Settings()
+        self._settings.apply_to_config()
+        self._theme_manager = ThemeManager()
+
+        # Get bot name from settings
+        self._bot_name = self._settings.get("bot_name", "Zeina")
+
+        # Float layout so we can overlay floating buttons
         wrapper = FloatLayout()
 
         # Root layout with generous padding
         root = BoxLayout(
             orientation='vertical',
-            spacing=6,
+            spacing=10,
             padding=[16, 12, 16, 16],
             size_hint=(1, 1),
         )
@@ -58,40 +80,81 @@ class ZeinaApp(App):
         self._status = StatusWidget()
         root.add_widget(self._status)
 
-        # Toggle panel (collapsible)
-        self._toggle_panel = TogglePanel(on_toggle_changed=self._on_toggle_changed)
-        root.add_widget(self._toggle_panel)
-
         # Chat widget (bottom)
         self._chat = ChatWidget(size_hint_y=1.2)
         root.add_widget(self._chat)
 
         wrapper.add_widget(root)
 
-        # Small floating settings button (always visible, bottom-right corner)
-        self._settings_btn = Button(
-            text="...",
-            font_size='20sp',
+        # Floating "..." menu button (top-right)
+        menu_icon = icon("dots_vertical", "...")
+        self._menu_btn = Button(
+            text=menu_icon,
+            font_name="Icons" if self._has_icons else "Roboto",
+            font_size='22sp' if self._has_icons else '20sp',
             size_hint=(None, None),
-            size=(40, 40),
-            pos_hint={'right': 0.98, 'top': 0.99},
+            size=(44, 44),
             background_normal='atlas://data/images/defaulttheme/button',
             background_color=(0.2, 0.2, 0.24, 0.7),
             color=(0.7, 0.75, 0.8, 0.9),
         )
-        self._settings_btn.bind(on_release=self._toggle_settings_panel)
-        wrapper.add_widget(self._settings_btn)
+        self._menu_btn.bind(on_release=self._open_menu)
+
+        # Wrap in AnchorLayout with 20px padding
+        menu_container = AnchorLayout(
+            anchor_x='right',
+            anchor_y='top',
+            padding=[20, 20, 20, 20]
+        )
+        menu_container.add_widget(self._menu_btn)
+        wrapper.add_widget(menu_container)
+
+        # Build the dropdown menu
+        self._build_menu()
+
+        # Settings screen overlay (hidden initially)
+        self._settings_screen = SettingsScreen(
+            settings=self._settings, app=self, face_widget=self._face,
+            size_hint=(1, 1),
+        )
+        self._settings_screen.opacity = 0
+        self._settings_screen.disabled = True
+        wrapper.add_widget(self._settings_screen)
+
+        # Diagnostics overlay (hidden initially)
+        self._diagnostics = DiagnosticsWidget(size_hint=(1, 1))
+        self._diagnostics.opacity = 0
+        self._diagnostics.disabled = True
+        wrapper.add_widget(self._diagnostics)
 
         # Build the KivyDisplay bridge
         self._kivy_display = KivyDisplay(self._face, self._status, self._chat)
 
-        # Boot into clean mode: face + status + tool log, no chat stream
-        self._toggle_panel.apply_preset("clean")
-        self._panel_visible = False
-        self._toggle_panel.opacity = 0
-        self._toggle_panel.height = 0
-        self._toggle_panel.disabled = True
+        # Sync initial toggle state — KivyDisplay defaults don't match actual startup state
+        self._kivy_display.toggles['chat'] = self._chat_visible      # False at start
+        self._kivy_display.toggles['speaking'] = not self._tts_muted  # True at start
+
+        # Boot into clean mode: face + status, no chat stream
         self._chat.hide_input()
+        self._chat.set_stream_visible(False)
+
+        # Apply theme from settings
+        theme_name = self._settings.get("theme", "default")
+        self._theme_manager.apply(self, theme_name)
+
+        # Apply animation theme from settings
+        anim_theme = self._settings.get("animation_theme", "vector")
+        self._face.set_animation_theme(anim_theme)
+        self._adjust_face_size(anim_theme)
+
+        # Set bot name on status bar (right side shows bot name only)
+        self._status.set_model(self._bot_name)
+
+        # Apply saved status bar component visibility
+        self._apply_status_bar_settings()
+
+        # Restore persisted UI toggle states
+        self._restore_ui_toggles()
 
         # Keyboard handling
         Window.bind(on_key_down=self._on_key_down)
@@ -104,59 +167,189 @@ class ZeinaApp(App):
 
         return wrapper
 
-    def _toggle_settings_panel(self, *args):
-        """Show/hide the toggle panel."""
-        self._panel_visible = not self._panel_visible
-        if self._panel_visible:
-            self._toggle_panel.opacity = 1
-            self._toggle_panel.height = 40
-            self._toggle_panel.disabled = False
-            self._settings_btn.color = (0.7, 0.75, 0.8, 0.9)
-        else:
-            self._toggle_panel.opacity = 0
-            self._toggle_panel.height = 0
-            self._toggle_panel.disabled = True
-            self._settings_btn.color = (0.5, 0.5, 0.55, 0.6)
+    # ── Status bar settings ────────────────────────────────────
 
-    def _on_toggle_changed(self, key, is_on):
-        """Handle toggle button state changes."""
-        self._kivy_display.toggles[key] = is_on
+    def _apply_status_bar_settings(self):
+        """Apply per-element status bar visibility from settings."""
+        self._status.set_mode_visible(
+            self._settings.get("status_show_mode", True))
+        self._status.set_model_visible(
+            self._settings.get("status_show_botname", True))
+        self._status.set_tool_log_enabled(
+            self._settings.get("status_show_toollog", True))
 
-        if key == "speaking":
-            if not is_on and self._assistant and self._assistant.is_speaking:
-                self._assistant.tts_engine.stop()
-                self._assistant.is_speaking = False
-                self._assistant.set_state(RecordingState.IDLE)
-        elif key == "face":
-            Clock.schedule_once(lambda dt: self._set_face_visibility(is_on), 0)
-        elif key == "status":
-            Clock.schedule_once(lambda dt: self._set_status_visibility(is_on), 0)
-        elif key == "chat":
-            Clock.schedule_once(lambda dt: self._set_chat_visibility(is_on), 0)
-            if is_on:
-                Clock.schedule_once(lambda dt: self._chat.show_input(), 0)
-            else:
-                Clock.schedule_once(lambda dt: self._chat.hide_input(), 0)
+    def _restore_ui_toggles(self):
+        """Restore persisted menu toggle states (TTS, chat feed, status bar)."""
+        # TTS muted
+        saved_muted = self._settings.get("tts_muted", False)
+        if saved_muted:
+            self._tts_muted = True
+            self._kivy_display.toggles['speaking'] = False
+            self._face.set_mouth_visible(False)
 
-    def _set_face_visibility(self, visible):
-        if visible:
-            self._face.opacity = 1
-            self._face.size_hint_y = 1
-        else:
-            self._face.opacity = 0
-            self._face.size_hint_y = 0.001
+        # Chat feed
+        saved_chat = self._settings.get("chat_feed_visible", False)
+        if saved_chat:
+            self._chat_visible = True
+            self._kivy_display.toggles['chat'] = True
+            self._chat.set_stream_visible(True)
 
-    def _set_status_visibility(self, visible):
-        if visible:
+        # Status bar overall visibility
+        saved_status = self._settings.get("status_bar_visible", True)
+        if not saved_status:
+            self._status_visible = False
+            self._status.opacity = 0
+            self._status.height = 0
+            self._kivy_display.toggles['tool_log'] = False
+
+    # ── Dropdown menu ─────────────────────────────────────────
+
+    def _build_menu(self):
+        """Build the icon-only dropdown menu."""
+        self._dropdown = DropDown(auto_width=False, width=56)
+        self._menu_items = {}
+        self._menu_bg_colors = {}  # Color instruction per button for theme updates
+
+        theme = self._theme_manager.current_theme
+        bg = theme.get("chat_input_bg", (0.10, 0.11, 0.14, 0.98))
+        on_color = theme.get("face_sparkle", (0.55, 0.85, 0.75, 1))
+
+        # (key, icon_name, fallback, callback, icon_size)
+        items = [
+            ("tools",    "monitor",     "[T]", self._toggle_status_bar, '22sp'),
+            ("chat",     "chat",        "[C]", self._toggle_chat_feed,  '22sp'),
+            ("audio",    "volume_high", "[V]", self._toggle_mute,       '22sp'),
+            ("settings", "cog",         "[S]", self._open_settings,     '26sp'),
+        ]
+
+        for key, icon_name, fallback, callback, icon_size in items:
+            icon_char = icon(icon_name, fallback)
+            btn = Button(
+                text=icon_char,
+                font_name="Icons" if self._has_icons else "Roboto",
+                font_size=icon_size if self._has_icons else '13sp',
+                size_hint_y=None,
+                height=50,
+                background_normal='',
+                background_color=(0, 0, 0, 0),
+                color=on_color,
+                halign='center',
+                valign='middle',
+            )
+
+            with btn.canvas.before:
+                color_instr = Color(*bg)
+                self._menu_bg_colors[key] = color_instr
+                btn._bg_rect = RoundedRectangle(pos=btn.pos, size=btn.size, radius=[4])
+            btn.bind(
+                pos=lambda inst, v: setattr(inst._bg_rect, 'pos', v),
+                size=lambda inst, v: setattr(inst._bg_rect, 'size', v),
+            )
+
+            def _on_press(instance, cb=callback, k=key):
+                cb()
+                # Update icon colors in place — do NOT dismiss the dropdown
+                Clock.schedule_once(lambda dt: self._update_menu_status(), 0)
+
+            btn.bind(on_release=_on_press)
+            btn._menu_key = key
+            btn._icon_name = icon_name
+            self._menu_items[key] = btn
+            self._dropdown.add_widget(btn)
+
+    def _open_menu(self, trigger):
+        """Open the dropdown menu, updating status indicators first."""
+        self._update_menu_status()
+        self._dropdown.open(trigger)
+
+    def _update_menu_status(self):
+        """Update icon colors to reflect current toggle states."""
+        theme = self._theme_manager.current_theme
+        ON_COLOR = theme.get("face_sparkle", (0.55, 0.85, 0.75, 1))
+        OFF_COLOR = theme.get("toggle_off_text", (0.5, 0.4, 0.4, 0.6))
+        MUTE_COLOR = (0.9, 0.4, 0.4, 0.9)
+
+        for key, btn in self._menu_items.items():
+            if key == "tools":
+                btn.color = ON_COLOR if self._status_visible else OFF_COLOR
+                if self._has_icons:
+                    btn.text = icon("monitor")
+            elif key == "chat":
+                btn.color = ON_COLOR if self._chat_visible else OFF_COLOR
+            elif key == "audio":
+                muted = self._tts_muted
+                btn.color = MUTE_COLOR if muted else ON_COLOR
+                if self._has_icons:
+                    btn.text = icon("volume_off") if muted else icon("volume_high")
+            elif key == "settings":
+                btn.color = ON_COLOR
+
+    def apply_menu_theme(self, theme: dict):
+        """Update dropdown menu backgrounds and icon colors to match the theme."""
+        bg = theme.get("chat_input_bg", (0.10, 0.11, 0.14, 0.98))
+        for color_instr in self._menu_bg_colors.values():
+            color_instr.rgba = bg
+        self._update_menu_status()
+
+    # ── Menu action callbacks ─────────────────────────────────
+
+    def _toggle_status_bar(self):
+        """Toggle the entire status bar visibility."""
+        self._status_visible = not self._status_visible
+        if self._status_visible:
             self._status.opacity = 1
-            self._status.height = 52
+            self._status.height = 62
         else:
             self._status.opacity = 0
             self._status.height = 0
+        # Keep tool_log toggle in sync
+        self._kivy_display.toggles['tool_log'] = self._status_visible
+        self._settings.set("status_bar_visible", self._status_visible)
 
-    def _set_chat_visibility(self, visible):
-        """Toggle only the message stream, not the text input."""
-        self._chat.set_stream_visible(visible)
+    def _toggle_chat_feed(self):
+        """Toggle the chat message transcript visibility (not the input)."""
+        self._chat_visible = not self._chat_visible
+        self._kivy_display.toggles['chat'] = self._chat_visible
+        self._settings.set("chat_feed_visible", self._chat_visible)
+
+        if self._chat_visible:
+            self._chat.set_stream_visible(True)
+            # Only show input if currently in CHAT mode
+            if self._assistant and self._assistant.mode == InteractionMode.CHAT:
+                self._chat.show_input()
+        else:
+            self._chat.set_stream_visible(False)
+            # Only hide input if not in CHAT mode (chat mode manages its own input)
+            if not (self._assistant and self._assistant.mode == InteractionMode.CHAT):
+                self._chat.hide_input()
+
+    def _toggle_mute(self):
+        """Toggle TTS mute on/off."""
+        self._tts_muted = not self._tts_muted
+        self._kivy_display.toggles['speaking'] = not self._tts_muted
+        self._face.set_mouth_visible(not self._tts_muted)
+        self._settings.set("tts_muted", self._tts_muted)
+
+        if self._tts_muted and self._assistant and self._assistant.is_speaking:
+            self._assistant.tts_engine.stop()
+            self._assistant.is_speaking = False
+            self._assistant.set_state(RecordingState.IDLE)
+
+    def _open_settings(self):
+        """Open the settings screen overlay."""
+        self._dropdown.dismiss()
+        Clock.schedule_once(lambda dt: self._settings_screen.show(), 0.05)
+
+    # ── Settings screen ───────────────────────────────────────
+
+    def _toggle_settings_screen(self, *args):
+        """Show/hide the full settings screen overlay."""
+        if self._settings_screen.is_visible:
+            self._settings_screen.hide()
+        else:
+            self._settings_screen.show()
+
+    # ── Assistant init ────────────────────────────────────────
 
     def _init_assistant(self, dt):
         """Initialize ZeinaAssistant on a background thread to avoid blocking the UI."""
@@ -165,7 +358,10 @@ class ZeinaApp(App):
         def _do_init():
             try:
                 from zeina.assistant import ZeinaAssistant
-                self._assistant = ZeinaAssistant(display=self._kivy_display)
+                self._assistant = ZeinaAssistant(
+                    display=self._kivy_display,
+                    settings=self._settings,
+                )
 
                 # Start audio input stream
                 self._stream = sd.InputStream(
@@ -176,8 +372,12 @@ class ZeinaApp(App):
                 self._stream.start()
 
                 Clock.schedule_once(lambda dt: self._status.set_status(
-                    "Press SPACE to talk", "green"
+                    "Push to talk", "green"
                 ), 0)
+
+                # Restore saved interaction mode
+                if self._settings.get("interaction_mode", "voice") == "chat":
+                    Clock.schedule_once(lambda dt: self._toggle_mode(), 0.1)
             except Exception as e:
                 err_msg = f"Init error: {e}"
                 Clock.schedule_once(lambda dt: self._status.set_status(
@@ -185,6 +385,8 @@ class ZeinaApp(App):
                 ), 0)
 
         threading.Thread(target=_do_init, daemon=True).start()
+
+    # ── Chat message handling ─────────────────────────────────
 
     def _on_chat_message(self, text):
         """Handle a message submitted via chat input while in voice mode."""
@@ -201,15 +403,28 @@ class ZeinaApp(App):
             daemon=True,
         ).start()
 
+    # ── Keyboard handling ─────────────────────────────────────
+
     def _on_key_down(self, window, key, scancode, codepoint, modifiers):
         """Handle keyboard events from Kivy."""
+        # ESC closes diagnostics or settings if open, otherwise quits
+        if key == 27:
+            if self._diagnostics.is_visible:
+                self._diagnostics.hide()
+                return True
+            if self._settings_screen.is_visible:
+                self._settings_screen.hide()
+                return True
+            if self._assistant is not None:
+                self._quit()
+            return True
+
         if self._assistant is None:
             return False
 
-        # ESC (key 27) - quit
-        if key == 27:
-            self._quit()
-            return True
+        # Don't handle keys when settings screen is open
+        if self._settings_screen.is_visible:
+            return False
 
         # TAB (key 9) - toggle mode
         if key == 9:
@@ -221,12 +436,30 @@ class ZeinaApp(App):
             self._show_model_selector()
             return True
 
-        # SPACEBAR (key 32) - voice controls
-        if key == 32:
+        # Ctrl+D - toggle diagnostics panel
+        if codepoint == 'd' and 'ctrl' in modifiers:
+            self._toggle_diagnostics()
+            return True
+
+        # PTT key — configurable (default: spacebar)
+        ptt_key = config.PUSH_TO_TALK_KEY
+        is_ptt = (
+            (ptt_key == "space" and key == 32)
+            or (len(ptt_key) == 1 and codepoint == ptt_key)
+        )
+        if is_ptt:
             self._handle_spacebar()
             return True
 
         return False
+
+    def _toggle_diagnostics(self):
+        """Toggle the diagnostics overlay (Ctrl+D)."""
+        if self._diagnostics.is_visible:
+            self._diagnostics.hide()
+        else:
+            self._diagnostics.refresh(self._assistant)
+            self._diagnostics.show()
 
     def _handle_spacebar(self):
         """Handle spacebar press for voice mode controls."""
@@ -257,38 +490,60 @@ class ZeinaApp(App):
             ).start()
 
     def _toggle_mode(self):
-        """Toggle between voice and chat mode (only shows/hides chat input)."""
+        """Toggle between voice and chat mode.
+        Chat input only appears in CHAT mode; the transcript follows _chat_visible."""
         if not self._assistant:
             return
+
+        bot_name = self._settings.get("bot_name", "Zeina")
 
         with self._assistant.mode_lock:
             if self._assistant.mode == InteractionMode.VOICE:
                 self._assistant._cleanup_voice_mode()
                 self._assistant.mode = InteractionMode.CHAT
-                self._kivy_display.show_menu_bar(InteractionMode.CHAT, "Zeina")
+                self._kivy_display.show_menu_bar(InteractionMode.CHAT, bot_name)
                 self._assistant.set_state(RecordingState.IDLE)
+                self._settings.set("interaction_mode", "chat")
+
                 def _enter_chat(dt):
+                    # Only show the input — transcript visibility follows _chat_visible
                     self._chat.show_input()
+
                 Clock.schedule_once(_enter_chat, 0)
+                self._chat_loop_id += 1
+                loop_id = self._chat_loop_id
                 self._assistant.chat_input_thread = threading.Thread(
-                    target=self._gui_chat_input_loop, daemon=True
+                    target=self._gui_chat_input_loop, args=(loop_id,), daemon=True
                 )
                 self._assistant.chat_input_thread.start()
             else:
                 self._chat.cancel_input()
                 self._assistant._cleanup_chat_mode()
                 self._assistant.mode = InteractionMode.VOICE
-                self._kivy_display.show_menu_bar(InteractionMode.VOICE, "Zeina")
+                self._kivy_display.show_menu_bar(InteractionMode.VOICE, bot_name)
                 self._assistant.set_state(RecordingState.IDLE)
+                self._settings.set("interaction_mode", "voice")
+
                 def _exit_chat(dt):
+                    # Hide input but keep transcript visible if _chat_visible is on
                     self._chat.hide_input()
+
                 Clock.schedule_once(_exit_chat, 0)
 
-    def _gui_chat_input_loop(self):
-        """Chat input loop for GUI mode, using KivyDisplay.get_chat_input."""
+    def _gui_chat_input_loop(self, loop_id: int):
+        """Chat input loop for GUI mode, using KivyDisplay.get_chat_input.
+
+        loop_id is a generation counter — if a newer loop has started (i.e.
+        _chat_loop_id > loop_id) this loop exits rather than entering
+        get_chat_input() again, preventing stale threads from competing for
+        the same input event and causing double-sends.
+        """
         while self._assistant and self._assistant.mode == InteractionMode.CHAT:
+            # Bail out if a newer loop has taken over
+            if loop_id != self._chat_loop_id:
+                break
             try:
-                user_input = self._kivy_display.get_chat_input("Type a message...")
+                user_input = self._kivy_display.get_chat_input("Enter message...")
                 if user_input is None:
                     break
                 if not user_input.strip():
@@ -306,6 +561,8 @@ class ZeinaApp(App):
                 traceback.print_exc()
                 break
 
+    # ── Model selector ────────────────────────────────────────
+
     def _show_model_selector(self):
         """Show a Kivy Popup for model selection."""
         try:
@@ -319,6 +576,8 @@ class ZeinaApp(App):
         if not models:
             self._status.set_status("No models found", "red")
             return
+
+        bot_name = self._settings.get("bot_name", "Zeina")
 
         content = BoxLayout(orientation='vertical', spacing=10, padding=[16, 12])
 
@@ -352,7 +611,8 @@ class ZeinaApp(App):
         def select_model(model_name):
             if model_name != config.OLLAMA_MODEL:
                 config.OLLAMA_MODEL = model_name
-                self._kivy_display.show_menu_bar(self._assistant.mode, "Zeina")
+                self._settings.set("ollama_model", model_name)
+                self._kivy_display.show_menu_bar(self._assistant.mode, bot_name)
             popup.dismiss()
 
         for model in models:
@@ -388,21 +648,61 @@ class ZeinaApp(App):
         popup.content = content
         popup.open()
 
-    def _quit(self):
-        """Clean shutdown."""
-        if self._assistant:
-            self._assistant._save_conversation()
-        if self._stream:
-            self._stream.stop()
-            self._stream.close()
-        self.stop()
+    # ── Face size adjustment ──────────────────────────────────
 
-    def on_stop(self):
-        """Called when the app is closing."""
+    def _adjust_face_size(self, anim_name: str):
+        """Give the face more vertical space for text-based animation styles."""
+        if anim_name == "ascii":
+            self._face.size_hint_y = 2.2
+        else:
+            self._face.size_hint_y = 1.0
+
+    # ── Shutdown ──────────────────────────────────────────────
+
+    def _quit(self):
+        """Clean shutdown — stop TTS first to avoid pygame blocking."""
+        self._stop_tts_gracefully()
+        if self._assistant:
+            try:
+                self._assistant._save_conversation()
+            except Exception:
+                pass
         if self._stream:
             try:
                 self._stream.stop()
                 self._stream.close()
-            except (AttributeError, RuntimeError) as e:
-                # Stream already closed or invalid
+            except Exception:
+                pass
+        self.stop()
+
+    def _stop_tts_gracefully(self):
+        """Stop TTS playback if active."""
+        if not self._assistant:
+            return
+        try:
+            if getattr(self._assistant, 'is_speaking', False):
+                self._assistant.tts_engine.stop()
+                self._assistant.is_speaking = False
+        except Exception:
+            pass
+        # Stop pygame mixer directly as a safety net
+        try:
+            import pygame
+            pygame.mixer.music.stop()
+        except Exception:
+            pass
+
+    def on_stop(self):
+        """Called when the app is closing (window X button or stop())."""
+        self._stop_tts_gracefully()
+        if self._assistant:
+            try:
+                self._assistant._save_conversation()
+            except Exception:
+                pass
+        if self._stream:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
                 pass

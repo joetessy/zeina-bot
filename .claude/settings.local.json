@@ -14,7 +14,11 @@
       "Bash(pip uninstall:*)",
       "Bash(ollama pull:*)",
       "Bash(wc:*)",
-      "Bash(du -sh:*)"
+      "Bash(du -sh:*)",
+      "Bash(venv/bin/python:*)",
+      "Bash(grep:*)",
+      "WebFetch(domain:github.com)",
+      "Bash(find:*)"
     ]
   }
 }

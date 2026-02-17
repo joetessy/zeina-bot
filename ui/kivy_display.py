@@ -29,6 +29,7 @@ class KivyDisplay:
             'chat': True,
             'speaking': True,
         }
+        self._face_stream_mode = False  # True when streaming text to the face widget
 
     # --- Helpers ---
 
@@ -124,3 +125,24 @@ class KivyDisplay:
     def get_chat_input(self, prompt: str) -> Optional[str]:
         """Block until user submits text. Called from pipeline thread, NOT main thread."""
         return self.chat_widget.get_chat_input(prompt)
+
+    # --- Streaming support ---
+
+    has_streaming = True
+
+    def begin_stream(self) -> None:
+        """Start a new streaming assistant bubble."""
+        self.chat_widget.begin_assistant_stream()
+        # If chat feed is hidden and TTS is muted, also stream text onto the face
+        self._face_stream_mode = (
+            not self.toggles.get('chat', True)
+            and not self.toggles.get('speaking', True)
+        )
+        if self._face_stream_mode:
+            self.face_widget.begin_face_stream()
+
+    def stream_token(self, token: str) -> None:
+        """Append a token to the active streaming bubble."""
+        self.chat_widget.append_stream_token(token)
+        if self._face_stream_mode:
+            self.face_widget.append_face_token(token)

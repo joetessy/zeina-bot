@@ -5,13 +5,13 @@
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                         ZeinaAssistant                                  │
-│                     (assistant.py - Orchestrator)                        │
+│                     (assistant.py - Orchestrator)                       │
 │                                                                         │
-│  ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────────────────┐ │
-│  │  State    │   │ Keyboard │   │  Thread  │   │  Conversation        │ │
-│  │  Machine  │   │ Handler  │   │  Manager │   │  History             │ │
-│  │          │   │ (pynput) │   │          │   │  (system + messages) │ │
-│  └──────────┘   └──────────┘   └──────────┘   └──────────────────────┘ │
+│  ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────────────────┐  │
+│  │  State   │   │ Keyboard │   │  Thread  │   │  Conversation        │  │
+│  │  Machine │   │ Handler  │   │  Manager │   │  History             │  │
+│  │          │   │ (Kivy)   │   │          │   │  (per-profile)       │  │
+│  └──────────┘   └──────────┘   └──────────┘   └──────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -20,7 +20,7 @@
 ```
                     ┌─────────────┐
                     │  User       │
-                    │  presses    │
+                    │  pushes     │
                     │  SPACEBAR   │
                     └──────┬──────┘
                            │
@@ -54,6 +54,10 @@
               │  → get_weather         │
               │  → calculate           │
               │  → get_current_time    │
+              │  → get_location        │
+              │  → read_file           │
+              │  → list_directory      │
+              │  → get_system_health   │
               │  → none                │
               └───────────┬────────────┘
                           │
@@ -63,12 +67,22 @@
                 │                   │
                 ▼                   │
    ┌────────────────────────┐       │
+   │   Arg Extraction       │       │
+   │   (llama3.2:3b)        │       │
+   │                        │       │
+   │  Second fast LLM call  │       │
+   │  extracts structured   │       │
+   │  args from user text   │       │
+   └───────────┬────────────┘       │
+               │                    │
+               ▼                    │
+   ┌────────────────────────┐       │
    │   Tool Execution       │       │
    │   (tools.py)           │       │
    │                        │       │
    │  Execute tool function │       │
    │  Inject result as      │       │
-   │  assistant context msg │       │
+   │  [DATA] user message   │       │
    └───────────┬────────────┘       │
                │                    │
                └────────┬───────────┘
@@ -79,7 +93,7 @@
               │  (llama3.1:8b)         │
               │                        │
               │  Full conversation     │
-              │  history + tool context│
+              │  history + tool data   │
               │  → Natural response    │
               └───────────┬────────────┘
                           │ response text
@@ -108,7 +122,7 @@
 ```
               ┌────────────────────────┐
               │  User types message    │
-              │  (custom raw input)    │
+              │  (Kivy TextInput)      │
               └───────────┬────────────┘
                           │ text
                           ▼
@@ -122,69 +136,143 @@
               tool needed    no tool
                     │           │
                     ▼           │
-              Tool Execution   │
+           Arg Extraction       │
+                    │           │
+                    ▼           │
+              Tool Execution    │
                     │           │
                     └─────┬─────┘
                           │
                           ▼
               ┌────────────────────────┐
               │  Main LLM Response     │
-              │  (displayed as text,   │
+              │  (token stream →       │
+              │   chat bubbles,        │
               │   no TTS playback)     │
               └────────────────────────┘
 ```
 
-## Tool Integration (Two-Step Pattern)
+## GUI Layout (Kivy)
+
+```
+┌─────────────────────────────────────────┐
+│                                     [⋮] │  ← 3-dot menu (top-right float)
+│  ┌─────────────────────────────────┐    │
+│  │                                 │    │
+│  │         FaceWidget              │    │  ← Animated face (Vector or ASCII)
+│  │      (canvas-drawn)             │    │
+│  │                                 │    │
+│  └─────────────────────────────────┘    │
+│  ┌─────────────────────────────────┐    │
+│  │ VOICE │  Push to talk   │ ZEINA │    │  ← StatusWidget (hideable)
+│  └─────────────────────────────────┘    │
+│  ┌─────────────────────────────────┐    │
+│  │  [chat bubbles / transcript]    │    │  ← ChatWidget (hideable)
+│  │                                 │    │
+│  │  ╭──────────────────────────╮   │    │
+│  │  │  Enter message...        │   │    │  ← Rounded TextInput (CHAT mode only)
+│  │  ╰──────────────────────────╯   │    │
+│  └─────────────────────────────────┘    │
+└─────────────────────────────────────────┘
+```
+
+### 3-Dot Menu
+
+Icon-only dropdown (no text labels). Clicking an item toggles its state without closing the menu.
+
+| Icon | Controls | State |
+|------|----------|-------|
+| Monitor | Status bar visibility | On/Off |
+| Chat | Message transcript | On/Off |
+| Volume | TTS audio mute | Muted/Active |
+| Cog | Settings overlay | Opens settings |
+
+### Settings Screen
+
+Full-screen overlay with sections:
+- **General**: Bot name, observability level (`off` / `lite` / `verbose`)
+- **AI Model**: Main model selector (fetches live list from Ollama)
+- **Voice**: TTS voice selector (scans `models/`), silence duration, VAD threshold
+- **Appearance**: Color theme, animation style (Vector / ASCII)
+- **Conversation**: Save history toggle, max messages, clear history
+- **Profiles**: Active profile switcher, new profile creation, delete profile
+
+Profile Save / Delete buttons are anchored at the bottom, independent of the scroll area.
+
+## Tool Integration (Three-Step Pattern)
 
 This design prevents the LLM from leaking tool reasoning into its spoken response.
 
 ```
-Step 1: Classification (isolated call)            Step 2: Execution + Response
-┌──────────────────────────────────────┐    ┌────────────────────────────────────┐
-│                                      │    │                                    │
-│  User message → Small fast model     │    │  Tool result injected as assistant │
-│  (3b) with simple prompt:           │    │  context message:                  │
-│                                      │    │                                    │
-│  "Which tool? web_search |          │    │  "I looked this up for you.       │
-│   get_weather | calculate |         │    │   Here's what I found: ..."       │
-│   get_current_time | none"          │    │                                    │
-│                                      │    │  Then main LLM (8b) generates    │
-│  Returns: tool name or "none"        │    │  natural conversational response   │
-│                                      │    │  (never sees tool schema)          │
-└──────────────────────────────────────┘    └────────────────────────────────────┘
+Step 1: Classification          Step 2: Arg Extraction        Step 3: Execution + Response
+┌───────────────────────┐    ┌────────────────────────┐    ┌───────────────────────────────┐
+│                       │    │                        │    │                               │
+│  User message →       │    │  Same fast model (3b)  │    │  Tool result injected as a    │
+│  small fast model     │    │  extracts structured   │    │  [DATA] user message:         │
+│  (3b):                │    │  args from natural     │    │                               │
+│                       │    │  language:             │    │  "[DATA] Search results for   │
+│  "Which tool?         │    │                        │    │   'Paris weather' ..."        │
+│   web_search |        │    │  location="London"     │    │                               │
+│   get_weather |       │    │  query="latest news"   │    │  Main LLM (8b) then generates │
+│   calculate |         │    │  expression="2+2"      │    │  a natural conversational     │
+│   get_current_time |  │    │  path="~/notes.txt"    │    │  response — never sees tool   │
+│   get_location |      │    │                        │    │  schema directly              │
+│   read_file |         │    │                        │    │                               │
+│   list_directory |    │    │                        │    │                               │
+│   get_system_health | │    │                        │    │                               │
+│   none"               │    │                        │    │                               │
+│                       │    │                        │    │                               │
+└───────────────────────┘    └────────────────────────┘    └───────────────────────────────┘
 ```
+
+### Tool Reference
+
+| Tool | Description | Key Restriction |
+|------|-------------|----------------|
+| `web_search` | DuckDuckGo search, top 5 results | Requires internet |
+| `get_weather` | Current conditions via OpenWeatherMap | Requires `OPENWEATHERMAP_API_KEY` in `.env` |
+| `calculate` | Safe math eval (trig, logs, constants) | No arbitrary code execution |
+| `get_current_time` | Current date/time with optional timezone | — |
+| `get_location` | Approximate location via IP (ipinfo.io) | Requires internet |
+| `read_file` | File contents up to 10 KB | Restricted to `~` and project root |
+| `list_directory` | Directory listing, dirs first, cap 100 | Restricted to `~` and project root |
+| `get_system_health` | CPU, memory, disk, battery, uptime (JSON) | Read-only; no historical data |
 
 ## Threading Model
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│                        Main Thread                            │
-│                                                               │
-│  pynput Keyboard Listener                                    │
+│                    Kivy Main Thread                          │
+│                                                              │
+│  Window.bind(on_key_down) keyboard handler                   │
 │  ├── SPACEBAR → start_listening() / process / interrupt      │
 │  ├── TAB → toggle_mode()                                     │
-│  ├── Ctrl+M → change_model()                                 │
-│  └── ESC → quit                                              │
+│  ├── Ctrl+M → model selector popup                           │
+│  ├── Ctrl+D → toggle diagnostics overlay                     │
+│  └── ESC → close overlay or quit                             │
+│                                                              │
+│  Clock.schedule_once() for all widget updates                │
 └──────────────────────────────────────────────────────────────┘
          │
          │ spawns
          ▼
 ┌──────────────────────┐  ┌──────────────────────┐  ┌─────────────────┐
-│  Face Animation      │  │  Audio Stream        │  │  Pipeline Thread │
-│  Thread (daemon)     │  │  Thread (sounddevice) │  │  (daemon, per   │
+│  Face Animation      │  │  Audio Stream        │  │  Pipeline Thread│
+│  (Kivy Clock 24fps)  │  │  Thread (sounddevice)│  │  (daemon, per   │
 │                      │  │                      │  │   interaction)  │
-│  Cycles ASCII frames │  │  Mic callback feeds  │  │                 │
-│  based on current    │  │  AudioRecorder       │  │  Transcribe →   │
-│  state               │  │  VAD analysis        │  │  Classify →     │
+│  FaceWidget ticks    │  │  Mic callback feeds  │  │                 │
+│  via Clock.schedule_ │  │  AudioRecorder       │  │  Transcribe →   │
+│  interval()          │  │  VAD analysis        │  │  Classify →     │
+│                      │  │                      │  │  Extract args → │
 │                      │  │                      │  │  [Tool] → LLM → │
 │                      │  │                      │  │  TTS → Auto-    │
-│                      │  │                      │  │  listen          │
+│                      │  │                      │  │  listen         │
 └──────────────────────┘  └──────────────────────┘  └─────────────────┘
 
 Thread Safety:
   state_lock  → protects RecordingState transitions
   mode_lock   → protects InteractionMode transitions
-  pause_face_updates flag → prevents animation during chat input
+  Clock.schedule_once() → all Kivy widget updates from non-main threads
 ```
 
 ## State Machine
@@ -209,35 +297,84 @@ Thread Safety:
           │       ┌────────────┐              │
           └───────│ PROCESSING │──────────────┘
                   └────────────┘
-                  (transcribe → classify → [tool] → LLM → TTS)
+                  (transcribe → classify → extract args → [tool] → LLM → TTS)
 ```
 
-## Display Layout (Terminal)
+## UI Module Structure
 
 ```
-┌──────────────────────────────────────────────────┐
-│  [Voice/Chat] mode    │    Model: llama3.1:8b    │  ← Menu Bar (line 1)
-├──────────────────────────────────────────────────┤
-│                                                  │
-│              ┌────────────────┐                  │
-│              │   (• _ •)      │                  │  ← Fixed Face Area
-│              │                │                  │     (animated, ~8 lines)
-│              └────────────────┘                  │
-│                                                  │
-│         🎤 Listening...                          │  ← Status Line
-│         ASR: 1.23s | LLM: 0.89s                 │  ← Detail Status
-├──────────────────────────────────────────────────┤
-│  ┌─ You ─────────────────────────────────────┐   │
-│  │ What's the weather in London?             │   │  ← Scrolling Feed
-│  └───────────────────────────────────────────┘   │     (Rich panels)
-│  🔧 Using tool: get_weather                     │
-│  ┌─ Zeina ───────────────────────────────────┐   │
-│  │ It's about twelve degrees in London right │   │
-│  │ now with partly cloudy skies.             │   │
-│  └───────────────────────────────────────────┘   │
-│                                                  │
-└──────────────────────────────────────────────────┘
-
-Face area uses ANSI DECSTBM (scrolling region) so the feed
-scrolls independently without overwriting the face.
+ui/
+├── app.py                  # Main Kivy App class, keyboard handling, menu
+├── kivy_display.py         # Display bridge (routes assistant → widgets via Clock)
+├── themes.py               # Color theme definitions + ThemeManager (5 themes)
+├── icons.py                # MDI icon font, Unicode/monospace font helpers
+├── animation_themes.py     # Face renderers: BMORenderer (vector) and ASCIIRenderer
+└── widgets/
+    ├── face_widget.py      # Canvas-drawn animated face (4 states, 24fps)
+    ├── status_widget.py    # Status bar (mode / status / bot name)
+    ├── chat_widget.py      # Scrollable message bubbles + rounded input
+    ├── settings_screen.py  # Full-screen settings overlay (6 sections)
+    ├── diagnostics_widget.py  # Ctrl+D live state + event log overlay
+    ├── toggle_panel.py     # Toggle panel (not currently mounted)
+    └── tool_log_widget.py  # Tool log strip (not currently mounted)
 ```
+
+## Data Layout
+
+```
+data/                          ← gitignored, auto-created on first run
+  settings.json                ← Active profile name only
+  profiles/
+    default.json               ← Per-profile settings (bot name, model, theme, ...)
+    <custom>.json
+  sessions/
+    default/                   ← One JSON file per app session (if save enabled)
+      2026-02-18_142741.json
+    <custom>/
+  memories/
+    default.json               ← Up to 50 user facts per profile
+    <custom>.json
+  logs/                        ← Reserved for future structured logging
+  tmp/                         ← Atomic write staging + temp audio files
+```
+
+Key design decisions:
+- **Conversation history is per-profile** — switching profiles resets context
+- **Settings are per-profile** — theme, model, voice, and VAD settings are all independent
+- **Memories are per-profile** — facts learned in one profile don't bleed into another
+- **Atomic writes** — all JSON saves go through a tmp file + rename to prevent corruption
+
+## Themes
+
+Five built-in color themes, selectable from Settings > Appearance:
+
+| Key | Display Name | Character |
+|-----|-------------|-----------|
+| `default` | Default | Dark teal/green |
+| `midnight` | Midnight | Deep blue/purple |
+| `terminal` | Terminal | Green-on-black monospace |
+| `sunset` | Sunset | Warm orange/red |
+| `ocean` | Ocean | Blue/cyan |
+
+## Animation Themes
+
+Two swappable renderers implement the `AnimationRenderer` base class:
+
+| Name | Key | Description |
+|------|-----|-------------|
+| Vector | `"vector"` | Procedural face (BMORenderer) with eyes, pupils, mouth, blush, sparkles |
+| ASCII | `"ascii"` | Unicode art frames, larger scale for readability |
+
+Both respond to four states: `idle`, `listening`, `processing`, `speaking`.
+
+## Observability
+
+Controlled by `OBSERVABILITY_LEVEL` in `zeina/config.py` (also settable via Settings > General):
+
+| Level | Terminal Output |
+|-------|----------------|
+| `off` | Silent (production default) |
+| `lite` | Timestamped lines for intent classification, LLM calls, response sizes |
+| `verbose` | Everything in `lite` plus full tool result previews |
+
+All events are also appended to `assistant.event_log` (a `deque(maxlen=50)`) regardless of level, so the Ctrl+D diagnostics panel always has data.

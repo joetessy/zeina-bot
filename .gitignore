@@ -9,10 +9,20 @@ env/
 ENV/
 *.egg-info/
 
+# Runtime data (settings, sessions, memories, profiles, logs, temp files)
+data/
+# Keep the directory structure in the repo
+!data/.gitkeep
+!data/profiles/.gitkeep
+!data/sessions/.gitkeep
+!data/memories/.gitkeep
+!data/conversations/.gitkeep
+!data/logs/.gitkeep
+!data/tmp/.gitkeep
+
 # Audio files
 *.wav
 *.mp3
-temp_*.wav
 
 # Model files
 models/

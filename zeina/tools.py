@@ -2,9 +2,27 @@
 Tool framework for Zeina AI Assistant
 Enables LLM to call external tools like web search, weather, calculator, etc.
 """
+import subprocess
+import os
+import pathlib
+import json
+import datetime
+import difflib
+import re
 from typing import Callable, Dict, Any, List, Optional
 from dataclasses import dataclass
+import psutil
+import platform
+import socket
 
+# ── Memory callback (set by assistant on init) ───────────────────────────────
+_memory_callback = None
+
+
+def set_memory_callback(cb) -> None:
+    """Register a callback(fact: str) that saves a fact to the active profile."""
+    global _memory_callback
+    _memory_callback = cb
 
 @dataclass
 class Tool:
@@ -82,6 +100,37 @@ tool_manager = ToolManager()
 # ============================================================================
 
 @tool_manager.register(
+    name="remember",
+    description=(
+        "Save a specific fact about the user to long-term memory. "
+        "Use ONLY when the user explicitly says 'remember that...', 'don't forget...', "
+        "or shares personal info they clearly want recalled in future conversations."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "fact": {
+                "type": "string",
+                "description": "The fact to remember about the user, phrased as a short statement"
+            }
+        },
+        "required": ["fact"]
+    }
+)
+def remember_fact(fact: str) -> str:
+    """Save a fact about the user to the active profile's memory file."""
+    fact = fact.strip()
+    if not fact:
+        return "Nothing to remember — fact was empty."
+    if _memory_callback:
+        try:
+            _memory_callback(fact)
+        except Exception as e:
+            return f"Couldn't save memory: {e}"
+    return f"Got it, I'll remember: {fact}"
+
+
+@tool_manager.register(
     name="web_search",
     description="Search the web. ONLY use this tool when the user explicitly asks to search or look something up online, or when the question requires very recent real-time information like today's news, live scores, or current prices. Do NOT use this for general knowledge, greetings, advice, or casual conversation.",
     parameters={
@@ -106,6 +155,10 @@ def web_search(query: str) -> str:
         return "Error: ddgs library not installed. Run: pip install ddgs"
 
     try:
+        import logging
+        for _noisy in ("ddgs", "curl_cffi", "httpx", "httpcore", "urllib3"):
+            logging.getLogger(_noisy).setLevel(logging.ERROR)
+
         from ddgs.http_client import HttpClient
         HttpClient._impersonates = ("random",)
         results = DDGS().text(query, max_results=5)
@@ -342,8 +395,401 @@ def get_location() -> str:
         return f"Error getting location: {str(e)}"
 
 
-# Print registered tools on import (for debugging)
-if __name__ == "__main__":
-    print(f"Registered {len(tool_manager.tools)} tools:")
-    for name, tool in tool_manager.tools.items():
-        print(f"  - {name}: {tool.description}")
+# ── File system tools ─────────────────────────────────────────────────────────
+
+def _get_safe_roots():
+    """Return allowed root paths (lazy so config is fully loaded)."""
+    from zeina import config as _cfg
+    return [pathlib.Path.home(), pathlib.Path(_cfg.PROJECT_ROOT)]
+
+
+_MAX_FILE_SIZE = 10_000  # 10 KB
+
+
+def _safe_path(raw: str):
+    """Resolve path and verify it is within an allowed root. Returns Path or None."""
+    p = pathlib.Path(raw).expanduser().resolve()
+    for root in _get_safe_roots():
+        if p == root or root in p.parents:
+            return p
+    return None
+
+
+@tool_manager.register(
+    name="read_file",
+    description="Read the contents of a file. Only works for files inside the home directory or project folder.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Absolute or ~ path to the file to read"
+            }
+        },
+        "required": ["path"]
+    }
+)
+def read_file(path: str) -> str:
+    """Read and return file contents (up to 10 KB)."""
+    p = _safe_path(path)
+    if p is None:
+        return "Path is outside allowed directories (home or project root)."
+    if not p.exists():
+        return f"File not found: {path}"
+    if not p.is_file():
+        return f"Not a file: {path}"
+    if p.stat().st_size > _MAX_FILE_SIZE:
+        return "File too large to read (> 10 KB)."
+    return p.read_text(errors="replace")
+
+
+_MAX_DIR_ENTRIES = 100
+
+
+@tool_manager.register(
+    name="list_directory",
+    description="List files and folders in a directory. Defaults to the home directory.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Directory path to list (defaults to ~)"
+            }
+        },
+        "required": []
+    }
+)
+def list_directory(path: str = "~") -> str:
+    """List directory contents, dirs first. Caps at 100 entries."""
+    p = _safe_path(path or "~")
+    if p is None:
+        return "Path is outside allowed directories (home or project root)."
+    if not p.exists():
+        return f"Directory not found: {path}"
+    if not p.is_dir():
+        return f"Not a directory: {path}"
+    try:
+        entries = sorted(p.iterdir(), key=lambda e: (not e.is_dir(), e.name))
+        lines = [f"{'[DIR] ' if e.is_dir() else '      '}{e.name}" for e in entries[:_MAX_DIR_ENTRIES]]
+        if len(entries) > _MAX_DIR_ENTRIES:
+            lines.append(f"... ({len(entries) - _MAX_DIR_ENTRIES} more entries not shown)")
+        return "\n".join(lines) or "Empty directory."
+    except PermissionError:
+        return f"Permission denied: {path}"
+
+@tool_manager.register(
+    name="get_system_health",
+    description="Get a real-time report of the computer's health, including CPU, memory, disk, battery, working directory, and system information.",
+    parameters={"type": "object", "properties": {}}
+)
+def get_system_health() -> dict:
+    """Gathers high-level system metrics using psutil and system commands."""
+    try:
+        import json
+        
+        # CPU
+        cpu_usage = psutil.cpu_percent(interval=0.1)
+        load_avg = [round(x, 2) for x in psutil.getloadavg()] if hasattr(psutil, "getloadavg") else None
+        
+        # Memory
+        mem = psutil.virtual_memory()
+        
+        # Storage (Root filesystem)
+        usage = psutil.disk_usage('/')
+        
+        # Battery
+        battery = psutil.sensors_battery()
+        
+        # System information
+        try:
+            uname_result = subprocess.run(["uname", "-a"], capture_output=True, text=True, timeout=5)
+            system_info = uname_result.stdout.strip() if uname_result.returncode == 0 else platform.platform()
+        except:
+            system_info = platform.platform()
+        
+        # Current working directory
+        try:
+            pwd_result = subprocess.run(["pwd"], capture_output=True, text=True, timeout=5)
+            current_directory = pwd_result.stdout.strip() if pwd_result.returncode == 0 else os.getcwd()
+        except:
+            current_directory = os.getcwd()
+        
+        # System uptime (if available)
+        try:
+            uptime_result = subprocess.run(["uptime"], capture_output=True, text=True, timeout=5)
+            uptime_info = uptime_result.stdout.strip() if uptime_result.returncode == 0 else None
+        except:
+            uptime_info = None
+        
+        # Network connectivity (basic check)
+        network_status = "online"  # Assume online unless we can detect otherwise
+        
+        # Build structured report
+        report = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "system": {
+                "os": platform.system(),
+                "platform": system_info,
+                "uptime": uptime_info
+            },
+            "current_directory": current_directory,
+            "cpu": {
+                "usage_percent": round(cpu_usage, 1),
+                "load_average": load_avg
+            },
+            "memory": {
+                "total_gb": round(mem.total / (1024**3), 2),
+                "available_gb": round(mem.available / (1024**3), 2),
+                "used_percent": round(mem.percent, 1)
+            },
+            "storage": {
+                "total_gb": round(usage.total / (1024**3), 2),
+                "free_gb": round(usage.free / (1024**3), 2),
+                "used_percent": round(usage.percent, 1)
+            },
+            "battery": {
+                "percent": round(battery.percent, 1) if battery else None,
+                "power_plugged": battery.power_plugged if battery else None
+            } if battery else None,
+            "network": network_status
+        }
+        
+        # Return as JSON string for clean parsing by LLM
+        return json.dumps(report, indent=2)
+        
+    except Exception as e:
+        return json.dumps({"error": f"Failed to retrieve health data: {str(e)}"})
+
+
+# ── Shell execution tool ──────────────────────────────────────────────────────
+
+def _resolve_app_name(app_name: str) -> str:
+    """Find the best-matching installed .app bundle name for a user-supplied string.
+
+    Scans /Applications and ~/Applications, normalises both the query and each
+    candidate (lowercase, strip spaces/hyphens/underscores/dots), then tries:
+      1. Exact normalised match
+      2. One string contains the other
+      3. difflib close match (cutoff 0.5)
+    Returns the original string unchanged if no good match is found.
+    """
+    search_dirs = [
+        pathlib.Path("/Applications"),
+        pathlib.Path("/System/Applications"),
+        pathlib.Path("/System/Applications/Utilities"),
+        pathlib.Path.home() / "Applications",
+    ]
+    apps: list[str] = []
+    for d in search_dirs:
+        if d.is_dir():
+            try:
+                for entry in d.iterdir():
+                    if entry.suffix == ".app":
+                        apps.append(entry.stem)
+            except PermissionError:
+                continue
+
+    if not apps:
+        return app_name
+
+    def _norm(s: str) -> str:
+        return re.sub(r'[\s\-_.]', '', s).lower()
+
+    query_norm = _norm(app_name)
+
+    # 1. Exact normalised match
+    for app in apps:
+        if _norm(app) == query_norm:
+            return app
+
+    # 2. One contains the other (normalised)
+    for app in apps:
+        app_n = _norm(app)
+        if query_norm in app_n or app_n in query_norm:
+            return app
+
+    # 3. difflib fuzzy match on normalised names
+    norm_to_real = {_norm(a): a for a in apps}
+    matches = difflib.get_close_matches(query_norm, list(norm_to_real.keys()), n=1, cutoff=0.5)
+    if matches:
+        return norm_to_real[matches[0]]
+
+    return app_name
+
+
+# Commands containing these patterns are always refused.
+_SHELL_BLOCKED = [
+    "rm -rf", "rm -fr", "sudo rm", "mkfs", "dd if=", ":(){", "> /dev",
+    "chmod 777 /", "chown root", "curl | sh", "wget | sh", "curl | bash", "wget | bash",
+]
+
+
+@tool_manager.register(
+    name="execute_shell",
+    description=(
+        "Execute a shell command on the system. Use for opening apps, running scripts, "
+        "listing processes, or performing system tasks the user requests."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "command": {
+                "type": "string",
+                "description": "The shell command to execute (e.g. 'open -a Calculator', 'ls -la ~')"
+            }
+        },
+        "required": ["command"]
+    }
+)
+def execute_shell(command: str) -> str:
+    """Execute a shell command after safety checks."""
+    command = command.strip()
+    if not command:
+        return "No command provided."
+
+    # Resolve app name for 'open -a <name>' commands so the user can say the
+    # app's natural name (e.g. "Visual Studio Code") regardless of how the LLM
+    # chose to spell it.
+    open_a_match = re.match(r'^(open\s+-a\s+)([\"\']?)(.+?)\2\s*$', command, re.IGNORECASE)
+    if open_a_match:
+        raw_app = open_a_match.group(3).strip()
+        resolved = _resolve_app_name(raw_app)
+        if resolved != raw_app:
+            command = f"open -a '{resolved}'"
+
+    # Block obviously dangerous patterns
+    cmd_lower = command.lower()
+    for blocked in _SHELL_BLOCKED:
+        if blocked.lower() in cmd_lower:
+            return f"Refused: command contains blocked pattern '{blocked}'."
+
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        # 'open' always exits 0 with no output on success; give the LLM a clear
+        # signal so it doesn't hallucinate "already running" or "not found".
+        if result.returncode == 0 and re.match(r'^open\b', command, re.IGNORECASE):
+            app_match = re.match(r"open\s+-a\s+['\"]?([^'\"]+)['\"]?", command, re.IGNORECASE)
+            app_label = app_match.group(1).strip() if app_match else command
+            return f"Launched '{app_label}' successfully."
+        output = (result.stdout.strip() or result.stderr.strip() or "(no output)")
+        # Truncate very long output so LLM doesn't get flooded
+        if len(output) > 2000:
+            output = output[:2000] + "\n... (truncated)"
+        return f"Exit {result.returncode}:\n{output}"
+    except subprocess.TimeoutExpired:
+        return "Command timed out after 30 seconds."
+    except Exception as e:
+        return f"Error executing command: {e}"
+
+
+# ── Clipboard tools ──────────────────────────────────────────────────────────
+
+@tool_manager.register(
+    name="read_clipboard",
+    description="Read the current contents of the system clipboard.",
+    parameters={"type": "object", "properties": {}, "required": []}
+)
+def read_clipboard() -> str:
+    """Read text from the system clipboard."""
+    system = platform.system()
+    try:
+        if system == "Darwin":
+            result = subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=5)
+            return result.stdout or "(clipboard is empty)"
+        elif system == "Linux":
+            for cmd in [["xclip", "-selection", "clipboard", "-o"],
+                        ["xsel", "--clipboard", "--output"]]:
+                try:
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+                    if result.returncode == 0:
+                        return result.stdout or "(clipboard is empty)"
+                except FileNotFoundError:
+                    continue
+            return "Error: install xclip or xsel to use clipboard on Linux (sudo apt install xclip)."
+        else:
+            return "Clipboard reading is not supported on this platform."
+    except Exception as e:
+        return f"Error reading clipboard: {e}"
+
+
+@tool_manager.register(
+    name="write_clipboard",
+    description="Write text to the system clipboard so the user can paste it elsewhere.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "content": {
+                "type": "string",
+                "description": "The text to copy to the clipboard"
+            }
+        },
+        "required": ["content"]
+    }
+)
+def write_clipboard(content: str) -> str:
+    """Write text to the system clipboard."""
+    system = platform.system()
+    try:
+        if system == "Darwin":
+            result = subprocess.run(
+                ["pbcopy"], input=content, capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                preview = content[:60] + "..." if len(content) > 60 else content
+                return f"Copied to clipboard: {preview}"
+            return f"Error copying to clipboard: {result.stderr}"
+        elif system == "Linux":
+            for cmd in [["xclip", "-selection", "clipboard"],
+                        ["xsel", "--clipboard", "--input"]]:
+                try:
+                    result = subprocess.run(
+                        cmd, input=content, capture_output=True, text=True, timeout=5
+                    )
+                    if result.returncode == 0:
+                        preview = content[:60] + "..." if len(content) > 60 else content
+                        return f"Copied to clipboard: {preview}"
+                except FileNotFoundError:
+                    continue
+            return "Error: install xclip or xsel to use clipboard on Linux (sudo apt install xclip)."
+        else:
+            return "Clipboard writing is not supported on this platform."
+    except Exception as e:
+        return f"Error writing to clipboard: {e}"
+
+
+# ── Knowledge base tool ───────────────────────────────────────────────────────
+
+@tool_manager.register(
+    name="query_knowledge_base",
+    description=(
+        "Search the local knowledge base for information stored in personal notes and documents "
+        "inside data/knowledge_base/. Use this when the user asks about something that might be "
+        "in their saved documents, notes, or reference files."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "What to search for in the knowledge base"
+            }
+        },
+        "required": ["query"]
+    }
+)
+def query_knowledge_base(query: str) -> str:
+    """Search the local knowledge base using semantic similarity."""
+    try:
+        from zeina.knowledge_base import get_kb
+        return get_kb().search(query)
+    except RuntimeError as e:
+        return str(e)
+    except Exception as e:
+        return f"Knowledge base error: {e}"

@@ -29,7 +29,7 @@ Zeina/
 │   ├── IMPLEMENTATION_PLAN.md  # Multi-phase evolution roadmap
 │   └── PHASE1_COMPLETE.md   # Phase 1 completion notes
 │
-├── conversations/           # Saved conversation history (when enabled)
+├── data/                    # Runtime data — gitignored (sessions, memories, profiles, logs)
 └── venv/                    # Python virtual environment
 ```
 
