@@ -2,9 +2,16 @@
 Tool framework for Zeina AI Assistant
 Enables LLM to call external tools like web search, weather, calculator, etc.
 """
+import subprocess
+import os
+import pathlib
+import json
+import datetime
 from typing import Callable, Dict, Any, List, Optional
 from dataclasses import dataclass
-
+import psutil
+import platform
+import socket
 
 @dataclass
 class Tool:
@@ -342,8 +349,168 @@ def get_location() -> str:
         return f"Error getting location: {str(e)}"
 
 
-# Print registered tools on import (for debugging)
-if __name__ == "__main__":
-    print(f"Registered {len(tool_manager.tools)} tools:")
-    for name, tool in tool_manager.tools.items():
-        print(f"  - {name}: {tool.description}")
+# ── File system tools ─────────────────────────────────────────────────────────
+
+def _get_safe_roots():
+    """Return allowed root paths (lazy so config is fully loaded)."""
+    from zeina import config as _cfg
+    return [pathlib.Path.home(), pathlib.Path(_cfg.PROJECT_ROOT)]
+
+
+_MAX_FILE_SIZE = 10_000  # 10 KB
+
+
+def _safe_path(raw: str):
+    """Resolve path and verify it is within an allowed root. Returns Path or None."""
+    p = pathlib.Path(raw).expanduser().resolve()
+    for root in _get_safe_roots():
+        if p == root or root in p.parents:
+            return p
+    return None
+
+
+@tool_manager.register(
+    name="read_file",
+    description="Read the contents of a file. Only works for files inside the home directory or project folder.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Absolute or ~ path to the file to read"
+            }
+        },
+        "required": ["path"]
+    }
+)
+def read_file(path: str) -> str:
+    """Read and return file contents (up to 10 KB)."""
+    p = _safe_path(path)
+    if p is None:
+        return "Path is outside allowed directories (home or project root)."
+    if not p.exists():
+        return f"File not found: {path}"
+    if not p.is_file():
+        return f"Not a file: {path}"
+    if p.stat().st_size > _MAX_FILE_SIZE:
+        return "File too large to read (> 10 KB)."
+    return p.read_text(errors="replace")
+
+
+_MAX_DIR_ENTRIES = 100
+
+
+@tool_manager.register(
+    name="list_directory",
+    description="List files and folders in a directory. Defaults to the home directory.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Directory path to list (defaults to ~)"
+            }
+        },
+        "required": []
+    }
+)
+def list_directory(path: str = "~") -> str:
+    """List directory contents, dirs first. Caps at 100 entries."""
+    p = _safe_path(path or "~")
+    if p is None:
+        return "Path is outside allowed directories (home or project root)."
+    if not p.exists():
+        return f"Directory not found: {path}"
+    if not p.is_dir():
+        return f"Not a directory: {path}"
+    try:
+        entries = sorted(p.iterdir(), key=lambda e: (not e.is_dir(), e.name))
+        lines = [f"{'[DIR] ' if e.is_dir() else '      '}{e.name}" for e in entries[:_MAX_DIR_ENTRIES]]
+        if len(entries) > _MAX_DIR_ENTRIES:
+            lines.append(f"... ({len(entries) - _MAX_DIR_ENTRIES} more entries not shown)")
+        return "\n".join(lines) or "Empty directory."
+    except PermissionError:
+        return f"Permission denied: {path}"
+
+@tool_manager.register(
+    name="get_system_health",
+    description="Get a real-time report of the computer's health, including CPU, memory, disk, battery, working directory, and system information.",
+    parameters={"type": "object", "properties": {}}
+)
+def get_system_health() -> dict:
+    """Gathers high-level system metrics using psutil and system commands."""
+    try:
+        import json
+        
+        # CPU
+        cpu_usage = psutil.cpu_percent(interval=0.1)
+        load_avg = [round(x, 2) for x in psutil.getloadavg()] if hasattr(psutil, "getloadavg") else None
+        
+        # Memory
+        mem = psutil.virtual_memory()
+        
+        # Storage (Root filesystem)
+        usage = psutil.disk_usage('/')
+        
+        # Battery
+        battery = psutil.sensors_battery()
+        
+        # System information
+        try:
+            uname_result = subprocess.run(["uname", "-a"], capture_output=True, text=True, timeout=5)
+            system_info = uname_result.stdout.strip() if uname_result.returncode == 0 else platform.platform()
+        except:
+            system_info = platform.platform()
+        
+        # Current working directory
+        try:
+            pwd_result = subprocess.run(["pwd"], capture_output=True, text=True, timeout=5)
+            current_directory = pwd_result.stdout.strip() if pwd_result.returncode == 0 else os.getcwd()
+        except:
+            current_directory = os.getcwd()
+        
+        # System uptime (if available)
+        try:
+            uptime_result = subprocess.run(["uptime"], capture_output=True, text=True, timeout=5)
+            uptime_info = uptime_result.stdout.strip() if uptime_result.returncode == 0 else None
+        except:
+            uptime_info = None
+        
+        # Network connectivity (basic check)
+        network_status = "online"  # Assume online unless we can detect otherwise
+        
+        # Build structured report
+        report = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "system": {
+                "os": platform.system(),
+                "platform": system_info,
+                "uptime": uptime_info
+            },
+            "current_directory": current_directory,
+            "cpu": {
+                "usage_percent": round(cpu_usage, 1),
+                "load_average": load_avg
+            },
+            "memory": {
+                "total_gb": round(mem.total / (1024**3), 2),
+                "available_gb": round(mem.available / (1024**3), 2),
+                "used_percent": round(mem.percent, 1)
+            },
+            "storage": {
+                "total_gb": round(usage.total / (1024**3), 2),
+                "free_gb": round(usage.free / (1024**3), 2),
+                "used_percent": round(usage.percent, 1)
+            },
+            "battery": {
+                "percent": round(battery.percent, 1) if battery else None,
+                "power_plugged": battery.power_plugged if battery else None
+            } if battery else None,
+            "network": network_status
+        }
+        
+        # Return as JSON string for clean parsing by LLM
+        return json.dumps(report, indent=2)
+        
+    except Exception as e:
+        return json.dumps({"error": f"Failed to retrieve health data: {str(e)}"})

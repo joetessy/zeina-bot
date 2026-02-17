@@ -124,3 +124,15 @@ class KivyDisplay:
     def get_chat_input(self, prompt: str) -> Optional[str]:
         """Block until user submits text. Called from pipeline thread, NOT main thread."""
         return self.chat_widget.get_chat_input(prompt)
+
+    # --- Streaming support ---
+
+    has_streaming = True
+
+    def begin_stream(self) -> None:
+        """Start a new streaming assistant bubble."""
+        self.chat_widget.begin_assistant_stream()
+
+    def stream_token(self, token: str) -> None:
+        """Append a token to the active streaming bubble."""
+        self.chat_widget.append_stream_token(token)

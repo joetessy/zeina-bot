@@ -126,3 +126,22 @@ class TogglePanel(BoxLayout):
             key: btn.state == 'down'
             for key, btn in self._toggles.items()
         }
+
+    def apply_theme(self, theme_dict):
+        """Update colors from a theme dict."""
+        global ON_COLOR, OFF_COLOR, ON_TEXT, OFF_TEXT
+        ON_COLOR = theme_dict.get("toggle_on", ON_COLOR)
+        OFF_COLOR = theme_dict.get("toggle_off", OFF_COLOR)
+        ON_TEXT = theme_dict.get("toggle_on_text", ON_TEXT)
+        OFF_TEXT = theme_dict.get("toggle_off_text", OFF_TEXT)
+        # Re-apply to existing buttons
+        for btn in self._toggles.values():
+            is_on = btn.state == 'down'
+            btn.background_color = ON_COLOR if is_on else OFF_COLOR
+            btn.color = ON_TEXT if is_on else OFF_TEXT
+        # Update panel background
+        bg_color = theme_dict.get("toggle_bg", (0.07, 0.08, 0.1, 0.9))
+        self.canvas.before.clear()
+        with self.canvas.before:
+            Color(*bg_color)
+            self._bg = RoundedRectangle(pos=self.pos, size=self.size, radius=[4])

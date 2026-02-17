@@ -1,17 +1,20 @@
 # Zeina AI Assistant
 
-A voice-activated AI assistant built entirely with open-source tools. Talk naturally using your voice, or switch to chat mode for text interaction. Features tool calling for web search, weather, calculations, and more.
+A voice-activated AI assistant built entirely with open-source tools. Talk naturally using your voice, or switch to chat mode for text interaction. Features tool calling for web search, weather, calculations, and more. Ships with an animated face and a full Kivy GUI.
 
 ## Features
 
-- **Push-to-Talk**: Press spacebar to start, auto-stops when you finish speaking
-- **Voice Activity Detection (VAD)**: Silero VAD detects when you stop speaking
+- **Push-to-Talk**: Push spacebar to start, auto-stops on silence
+- **Voice Activity Detection (VAD)**: Silero VAD detects when you finish speaking
 - **Continuous Conversation**: Auto-listens for follow-up questions after responding
-- **Interrupt Anytime**: Press spacebar while Zeina is speaking for instant interruption
+- **Interrupt Anytime**: Push spacebar while Zeina is speaking for instant interruption
 - **Dual Modes**: Voice mode (with TTS) and Chat mode (text only), toggle with TAB
 - **Tool Calling**: Web search, weather, calculator, and time tools
-- **Animated Face**: ASCII art face with state-responsive expressions
-- **Model Switching**: Change Ollama models on the fly with Ctrl+M
+- **Animated Face**: Vector (procedural) and ASCII art animation modes
+- **Settings UI**: Full-screen settings overlay with profiles, themes, and voice control
+- **Model Switching**: Change Ollama models on the fly with Ctrl+M or via settings
+- **Themes**: Default, Midnight, and Terminal color themes
+- **Profiles**: Multiple named profiles with independent settings
 
 ## Prerequisites
 
@@ -47,16 +50,25 @@ python main.py
 
 | Key | Action |
 |-----|--------|
-| `SPACEBAR` | Start/stop recording, interrupt TTS |
+| `SPACEBAR` | Push to talk / stop recording / interrupt TTS |
 | `TAB` | Toggle between Voice and Chat mode |
 | `Ctrl+M` | Change Ollama model |
-| `ESC` | Quit |
+| `ESC` | Close settings or quit |
+
+### 3-Dot Menu (top-right corner)
+
+| Icon | Action |
+|------|--------|
+| 👁 Eye | Show/hide status bar |
+| 💬 Chat | Show/hide message transcript |
+| 🔊 Volume | Mute/unmute TTS audio |
+| ⚙ Cog | Open settings |
 
 ### Voice Mode
-Press spacebar to start recording. Speak naturally - VAD auto-detects when you stop (~2s silence). Zeina transcribes, thinks, responds with voice, then auto-listens for follow-ups.
+Push spacebar to start recording. Speak naturally — VAD auto-detects when you stop (~2s silence). Zeina transcribes, thinks, responds with voice, then auto-listens for follow-ups.
 
 ### Chat Mode
-Press TAB to switch. Type your message and press Enter. Responses are displayed as text (no TTS).
+Press TAB to switch. The message transcript appears and a text input is shown. Type your message and press Enter. Responses are displayed as text (no TTS in chat mode).
 
 ## Tools
 
@@ -78,11 +90,10 @@ The weather tool requires a free OpenWeatherMap API key:
    cp .env.example .env
    # Edit .env and replace your_key_here with your actual key
    ```
-3. Without an API key, the weather tool will return an error message
 
 ## Configuration
 
-Edit `zeina/config.py` to customize:
+Most settings are managed through the in-app Settings screen (⚙ icon). For low-level tuning, edit `zeina/config.py`:
 
 - **OLLAMA_MODEL**: Main language model (default: `llama3.1:8b`)
 - **INTENT_CLASSIFIER_MODEL**: Fast model for tool routing (default: `llama3.2:3b`)
@@ -92,16 +103,16 @@ Edit `zeina/config.py` to customize:
 
 ### VAD Tuning
 
-- **VAD_THRESHOLD** (0.5): Speech detection sensitivity (0-1, lower = more sensitive)
+- **VAD_THRESHOLD** (0.5): Speech detection sensitivity (0–1, lower = more sensitive)
 - **SILENCE_DURATION** (2.0): Seconds of silence before auto-stop
 - **LISTENING_TIMEOUT** (5.0): Max seconds to wait for speech before returning to idle
 
 ### Observability
 
-Set `OBSERVABILITY_LEVEL` in config:
-- `"off"` - No metrics
-- `"lite"` - ASR, LLM, and TTS timing displayed
-- `"verbose"` - Full event logging
+Set via Settings > General > Observability:
+- `off` — No metrics
+- `lite` — ASR, LLM, and TTS timing displayed
+- `verbose` — Full event logging
 
 ## Troubleshooting
 
@@ -111,31 +122,25 @@ Set `OBSERVABILITY_LEVEL` in config:
 
 **"No speech detected"**
 - Check microphone is working
-- Try lowering `VAD_THRESHOLD` (e.g., 0.4)
+- Try lowering `VAD_THRESHOLD` (e.g., 0.4) in Settings > Voice
 - Try a larger Whisper model
 
 **"Recording cuts off mid-sentence"**
-- Increase `SILENCE_DURATION` (e.g., 2.5)
-- Lower `VAD_THRESHOLD`
+- Increase `SILENCE_DURATION` (e.g., 2.5) in Settings > Voice
 
 **Slow performance**
 - Use `tiny` or `base` Whisper model
 - Use a smaller Ollama model
 - Enable GPU: set `WHISPER_DEVICE = "cuda"`
 
+**Voice model change doesn't take effect**
+- After changing TTS Voice in Settings, the engine reloads automatically.
+  If it doesn't, restart the app.
+
 ## Architecture
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed architecture diagrams.
 
-## Roadmap
-
-See [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) for the full evolution plan:
-- **Phase 1**: Agent Framework + Web Search (complete)
-- **Phase 1.5**: Weather Tool (complete)
-- **Phase 2**: Kivy GUI for touchscreen
-- **Phase 3**: Settings UI + Polish
-- **Phase 4**: Additional Tools
-
 ## Credits
 
-Built with [Whisper](https://github.com/openai/whisper), [Ollama](https://ollama.ai), [Piper TTS](https://github.com/rhasspy/piper), [Silero VAD](https://github.com/snakers4/silero-vad), [Rich](https://github.com/Textualize/rich), and [DuckDuckGo Search](https://github.com/deedy5/ddgs).
+Built with [Kivy](https://kivy.org), [Whisper](https://github.com/openai/whisper), [Ollama](https://ollama.ai), [Piper TTS](https://github.com/rhasspy/piper), [Silero VAD](https://github.com/snakers4/silero-vad), and [DuckDuckGo Search](https://github.com/deedy5/ddgs).
