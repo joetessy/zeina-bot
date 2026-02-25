@@ -101,13 +101,23 @@ Chat Mode:
 ### Tool Integration Pattern
 
 Tools use a three-step approach to prevent the LLM from leaking tool reasoning:
-1. **Intent classification** - Fast call to `INTENT_CLASSIFIER_MODEL` (3b) decides which tool (or `none`). If the previous turn already fetched data via a tool, a context hint is prepended so the classifier can correctly return `none` for follow-up questions.
-2. **Argument extraction** - A second fast LLM call extracts structured args from the user's natural language (same classifier model). All tools use LLM-based extraction — no regex or token scanning.
-3. **Tool execution** - Result injected as a `[DATA]` user message, then the main LLM generates a natural response.
+1. **Intent classification** — Two-stage process (see below). Returns a tool name or `none`.
+2. **Argument extraction** — A fast LLM call extracts structured args from the user's natural language (same classifier model). All tools use LLM-based extraction — no regex or token scanning.
+3. **Tool execution** — Result injected as a `[DATA]` user message, then the main LLM generates a natural response.
+
+#### Two-stage Intent Classifier (`assistant.py:_classify_tool_intent`)
+
+`control_self` is the only tool that asks Zeina to change *herself*, making it semantically orthogonal to all other tools. It gets its own dedicated first stage:
+
+**Stage 1 — `_check_control_self(message)`**: Binary YES/NO LLM call with a focused prompt. If YES → returns `control_self` immediately without running Stage 2.
+
+**Stage 2 — main classifier**: Runs only when Stage 1 returns NO. Uses a multi-tool prompt covering all other tools. `control_self` is excluded from this list so it never competes with `execute_shell` or others.
+
+This keeps each stage's prompt simple and unambiguous. No hardcoded keyword guards anywhere.
 
 To add a new tool:
 1. Register it in `tools.py` with `@tool_manager.register(name, description, parameters)`
-2. Add a rule for it in `assistant.py:_classify_tool_intent()` classifier prompt
+2. If the tool is semantically unique like `control_self` (i.e. likely to be confused with others in the main prompt), give it its own stage-1 check in `_classify_tool_intent`. Otherwise, add a rule to the Stage 2 prompt.
 3. Add a `_build_tool_args()` branch that calls an LLM extractor (e.g. `_extract_location`, `_extract_path`, `_extract_shell_command`, or a new one following the same pattern)
 
 ### Observability

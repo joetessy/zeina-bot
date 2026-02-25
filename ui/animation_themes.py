@@ -410,8 +410,8 @@ class ASCIIRenderer(AnimationRenderer):
         color = w.EYE_COLOR
 
         # Scale font size relative to face area — larger for better visibility
-        font_size = int(min(sw, (ey - my + r * 2)) * 0.46)
-        font_size = max(42, min(font_size, 150))
+        font_size = int(min(sw, (ey - my + r * 2)) * 0.62)
+        font_size = max(60, min(font_size, 220))
 
         kwargs = dict(
             text=text,

@@ -38,6 +38,7 @@ class ZeinaApp(App):
 
     def build(self):
         self.title = "Zeina AI Assistant"
+        self.icon = "assets/zeina_icon.png"
         Window.size = (600, 600)
         Window.clearcolor = (0.06, 0.06, 0.08, 1)
 
@@ -101,13 +102,13 @@ class ZeinaApp(App):
         self._menu_btn.bind(on_release=self._open_menu)
 
         # Wrap in AnchorLayout with 20px padding
-        menu_container = AnchorLayout(
+        self._menu_container = AnchorLayout(
             anchor_x='right',
             anchor_y='top',
             padding=[20, 20, 20, 20]
         )
-        menu_container.add_widget(self._menu_btn)
-        wrapper.add_widget(menu_container)
+        self._menu_container.add_widget(self._menu_btn)
+        wrapper.add_widget(self._menu_container)
 
         # Build the dropdown menu
         self._build_menu()
@@ -340,6 +341,217 @@ class ZeinaApp(App):
         self._dropdown.dismiss()
         Clock.schedule_once(lambda dt: self._settings_screen.show(), 0.05)
 
+    # ── Bot self-control callback ──────────────────────────────
+
+    def _handle_ui_control(self, action: str, value: str = "") -> str:
+        """Invoked by the control_self tool to change app UI/settings.
+
+        Called from a background thread — all Kivy mutations are
+        scheduled onto the main thread via Clock.schedule_once.
+        Returns a human-readable result string for the LLM to relay.
+        """
+        value = (value or "").strip()
+        v = value.lower()
+
+        # ── Fuzzy value normalizers ───────────────────────────
+        def _theme():
+            for t in ("midnight", "terminal", "sunset", "default"):
+                if t in v:
+                    return t
+            return None
+
+        def _anim():
+            if "ascii" in v:
+                return "ascii"
+            if "vector" in v or "bmo" in v:
+                return "vector"
+            if v == "toggle":
+                current = self._settings.get("animation_theme", "vector")
+                return "ascii" if current == "vector" else "vector"
+            return None
+
+        def _want_show():
+            """Returns True=show, False=hide, None=unknown."""
+            if any(w in v for w in ("show", "open", "on", "enable", "visible")):
+                return True
+            if any(w in v for w in ("hide", "close", "off", "disable", "hidden")):
+                return False
+            return None
+
+        def _want_mute():
+            """Returns True=mute, False=unmute, None=toggle."""
+            if any(w in v for w in ("unmute", "enable", "on", "start")):
+                return False
+            if any(w in v for w in ("mute", "disable", "off", "stop", "silence")):
+                return True
+            return None
+
+        def _want_mode():
+            if "chat" in v or "text" in v or "type" in v:
+                return "chat"
+            if "voice" in v or "speak" in v or "talk" in v:
+                return "voice"
+            return None
+
+        # ── Determine what actually changes ──────────────────
+        theme     = _theme()
+        anim      = _anim()
+        mode      = _want_mode()
+        show_bool = _want_show()
+        mute_bool = _want_mute()
+
+        # ── switch_profile: validate before scheduling ────────
+        if action == "switch_profile":
+            available = self._settings.list_profiles()
+            target = value.lower().strip()
+            match = next((p for p in available if p.lower() == target), None)
+            if not match:
+                match = next((p for p in available if target in p.lower()), None)
+            if not match:
+                return (f"Profile '{value}' not found. "
+                        f"Available profiles: {', '.join(available)}.")
+
+            def _do_switch(dt=None):
+                self._settings.switch_profile(match)
+                self._settings.apply_to_config()
+                new = self._settings.get_all()
+                self._theme_manager.apply(self, new.get("theme", "default"))
+                bot = new.get("bot_name", "Zeina")
+                self._bot_name = bot
+                self._status.set_model(bot)
+                if self._assistant:
+                    self._kivy_display.show_menu_bar(self._assistant.mode, bot)
+
+            Clock.schedule_once(_do_switch, 0)
+            return f"Switched to profile '{match}'."
+
+        def _run(dt=None):
+            if action == "set_theme":
+                if theme:
+                    self._theme_manager.apply(self, theme)
+                    self._settings.set("theme", theme)
+
+            elif action == "set_animation":
+                if anim:
+                    self._face.set_animation_theme(anim)
+                    self._adjust_face_size(anim)
+                    self._settings.set("animation_theme", anim)
+
+            elif action == "set_mode":
+                target = mode
+                if target and self._assistant:
+                    if target == "voice" and self._assistant.mode == InteractionMode.CHAT:
+                        self._toggle_mode()
+                    elif target == "chat" and self._assistant.mode == InteractionMode.VOICE:
+                        self._toggle_mode()
+
+            elif action == "set_status_bar":
+                want = show_bool
+                if want is None:  # "toggle"
+                    self._toggle_status_bar()
+                elif want and not self._status_visible:
+                    self._toggle_status_bar()
+                elif not want and self._status_visible:
+                    self._toggle_status_bar()
+
+            elif action == "set_chat_feed":
+                want = show_bool
+                if want is None:
+                    self._toggle_chat_feed()
+                elif want and not self._chat_visible:
+                    self._toggle_chat_feed()
+                elif not want and self._chat_visible:
+                    self._toggle_chat_feed()
+
+            elif action == "set_tts_mute":
+                want = mute_bool
+                if want is None:
+                    self._toggle_mute()
+                elif want and not self._tts_muted:
+                    self._toggle_mute()
+                elif not want and self._tts_muted:
+                    self._toggle_mute()
+
+            elif action == "clear_history":
+                if self._assistant:
+                    self._assistant.conversation_history.clear()
+                self._settings.clear_session_history(config.ACTIVE_PROFILE)
+
+            elif action == "clear_memories":
+                self._settings.clear_memories(self._settings.active_profile_name)
+
+            elif action == "set_bot_name":
+                if value:
+                    self._settings.set("bot_name", value)
+                    self._bot_name = value
+                    self._status.set_model(value)
+                    if self._assistant:
+                        self._kivy_display.show_menu_bar(self._assistant.mode, value)
+
+            elif action == "set_user_name":
+                if value:
+                    self._settings.set("user_name", value)
+                    # Remove any memories that refer to a previous name so they
+                    # don't conflict with the updated user_name in the system prompt.
+                    _name_keywords = ("name is", "called ", "known as", "goes by")
+                    for fact in self._settings.load_memories(config.ACTIVE_PROFILE):
+                        if any(kw in fact.lower() for kw in _name_keywords):
+                            self._settings.remove_memory(config.ACTIVE_PROFILE, fact)
+                    if self._assistant:
+                        self._assistant.conversation_history.append({
+                            "role": "user",
+                            "content": f"[My name is {value} — please use this name from now on, not any previous name]",
+                        })
+
+            elif action == "open_settings":
+                self._settings_screen.show()
+
+            elif action == "open_diagnostics":
+                self._diagnostics.refresh(self._assistant)
+                self._diagnostics.show()
+
+            elif action == "set_menu_button":
+                visible = show_bool if show_bool is not None else True
+                self._menu_container.opacity = 1 if visible else 0
+                self._menu_btn.disabled = not visible
+
+        # Pre-update the toggle dict synchronously so begin_stream() sees the
+        # correct future state before the Clock callback fires on the main thread.
+        if action == "set_chat_feed":
+            if show_bool is None:
+                self._kivy_display.toggles['chat'] = not self._chat_visible
+            elif show_bool and not self._chat_visible:
+                self._kivy_display.toggles['chat'] = True
+            elif not show_bool and self._chat_visible:
+                self._kivy_display.toggles['chat'] = False
+        elif action == "set_tts_mute":
+            if mute_bool is None:
+                self._kivy_display.toggles['speaking'] = self._tts_muted  # toggle: muted→speaking
+            elif mute_bool and not self._tts_muted:
+                self._kivy_display.toggles['speaking'] = False  # muting
+            elif not mute_bool and self._tts_muted:
+                self._kivy_display.toggles['speaking'] = True   # unmuting
+
+        Clock.schedule_once(_run, 0)
+
+        # Build a human-readable result for the LLM
+        results = {
+            "set_theme":        f"Theme changed to {theme or value}.",
+            "set_animation":    f"Animation style changed to {anim or value}.",
+            "set_mode":         f"Mode switched to {mode or value}.",
+            "set_status_bar":   f"Status bar {'shown' if show_bool else 'hidden'}.",
+            "set_chat_feed":    f"Chat feed {'opened' if show_bool else 'closed'}.",
+            "set_tts_mute":     "TTS muted." if mute_bool else "TTS unmuted.",
+            "clear_history":    "Conversation history cleared.",
+            "clear_memories":   "Memories cleared.",
+            "set_bot_name":     f"Bot name updated to {value}.",
+            "set_user_name":    f"User name updated to {value}.",
+            "open_settings":    "Settings page opened.",
+            "open_diagnostics": "Diagnostics page opened.",
+            "set_menu_button":  f"Menu button {'shown' if show_bool else 'hidden'}.",
+        }
+        return results.get(action, "Done.")
+
     # ── Settings screen ───────────────────────────────────────
 
     def _toggle_settings_screen(self, *args):
@@ -362,6 +574,10 @@ class ZeinaApp(App):
                     display=self._kivy_display,
                     settings=self._settings,
                 )
+
+                # Wire up UI control callback so the bot can change its own settings
+                from zeina.tools import set_ui_control_callback
+                set_ui_control_callback(self._handle_ui_control)
 
                 # Start audio input stream
                 self._stream = sd.InputStream(

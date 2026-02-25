@@ -58,6 +58,11 @@
               │  → read_file           │
               │  → list_directory      │
               │  → get_system_health   │
+              │  → take_screenshot     │
+              │  → remember            │
+              │  → execute_shell       │
+              │  → read_clipboard      │
+              │  → write_clipboard     │
               │  → none                │
               └───────────┬────────────┘
                           │
@@ -237,6 +242,53 @@ Step 1: Classification          Step 2: Arg Extraction        Step 3: Execution 
 | `read_file` | File contents up to 10 KB | Restricted to `~` and project root |
 | `list_directory` | Directory listing, dirs first, cap 100 | Restricted to `~` and project root |
 | `get_system_health` | CPU, memory, disk, battery, uptime (JSON) | Read-only; no historical data |
+| `take_screenshot` | Capture screen, vision-model interprets, main LLM responds | macOS: `screencapture -x`; Linux: mss. Window hidden during capture |
+| `remember` | Save a user fact to long-term memory | Extracted by classifier LLM; stored in `data/memories/<profile>.json` |
+| `execute_shell` | Run a shell command | Requires verbal confirmation first; Zeina speaks the command and waits for user voice approval |
+| `read_clipboard` | Read system clipboard text | No internet; macOS/Linux |
+| `write_clipboard` | Write text to system clipboard | No internet; macOS/Linux |
+
+### Vision Pipeline (take_screenshot)
+
+```
+User asks about screen content
+        │
+        ▼
+  Kivy window hidden
+  (hide_window → Window.hide())
+        │
+        ▼
+  Screenshot captured
+  macOS: screencapture -x /tmp/...png
+  Linux: mss.monitors[1]
+        │
+        ▼
+  Kivy window shown again
+        │
+        ▼
+  Sanity check: file must be > 10 KB
+  (blank/black = Screen Recording denied)
+        │
+        ▼
+  Image resized to ≤ 1280 px wide (Pillow)
+        │
+        ▼
+  Vision model (moondream default)
+  prompted: "describe all visible text,
+  windows, UI elements verbatim"
+        │ description
+        ▼
+  Injected as: "[I am currently looking
+  at the user's screen...] {description}
+  Using what I can see, respond to:
+  {user_message}"
+        │
+        ▼
+  Main LLM responds with Zeina's
+  personality as if actively watching
+```
+
+Vision model is configured per-profile: Settings > AI Model > Vision Model.
 
 ## Threading Model
 

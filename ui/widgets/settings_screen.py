@@ -432,6 +432,10 @@ class SettingsScreen(FloatLayout):
             if key == "bot_name":
                 self._on_bot_name_changed(val)
             elif key == "user_name":
+                _name_keywords = ("name is", "called ", "known as", "goes by")
+                for fact in self._settings.load_memories(self._settings.active_profile_name):
+                    if any(kw in fact.lower() for kw in _name_keywords):
+                        self._settings.remove_memory(self._settings.active_profile_name, fact)
                 self._update_system_prompt_live()
 
         inp.bind(on_text_validate=_on_change)
@@ -1137,6 +1141,61 @@ class SettingsScreen(FloatLayout):
         save_btn.bind(on_release=_save)
         inp.bind(on_text_validate=_save)
         content.add_widget(save_btn)
+        popup.open()
+
+    def _on_delete_profile(self):
+        current = self._settings.active_profile_name
+        font = self._get_font()
+
+        if current == "default":
+            popup = Popup(
+                title="Cannot Delete",
+                content=Label(
+                    text="The default profile cannot be deleted.",
+                    font_name=font,
+                    font_size='13sp',
+                ),
+                size_hint=(0.6, 0.22),
+                background_color=(0.1, 0.1, 0.12, 0.98),
+            )
+            popup.open()
+            return
+
+        content = BoxLayout(orientation='vertical', spacing=12, padding=[20, 16])
+        content.add_widget(Label(
+            text=f'Delete profile "{current}"?\nThis cannot be undone.',
+            font_name=font,
+            font_size='13sp',
+            halign='center',
+        ))
+
+        popup = Popup(
+            title="Delete Profile",
+            content=content,
+            size_hint=(0.65, 0.3),
+            background_color=(0.1, 0.1, 0.12, 0.98),
+        )
+
+        def _confirm(instance):
+            self._settings.delete_profile(current)
+            popup.dismiss()
+            # Switch spinner and UI to default
+            self._profile_spinner.values = self._settings.list_profiles()
+            self._profile_spinner.text = self._settings.active_profile_name
+            self._on_profile_switch(None, self._settings.active_profile_name)
+
+        confirm_btn = Button(
+            text=f'Delete "{current}"',
+            size_hint_y=None,
+            height=44,
+            font_size='13sp',
+            font_name=font,
+            background_normal='',
+            background_color=(0.75, 0.15, 0.15, 0.95),
+            color=(1, 1, 1, 0.9),
+        )
+        confirm_btn.bind(on_release=_confirm)
+        content.add_widget(confirm_btn)
         popup.open()
 
     def _refresh(self):

@@ -44,6 +44,8 @@ DEFAULT_PROFILE = {
     "custom_instructions": "",      # Free-form addition, appended verbatim
     # User memory
     "memory_enabled": True,     # Extract and inject facts about the user
+    # Vision
+    "vision_model": "moondream",    # Vision-capable model for screenshot/screen queries
     # Controls
     "push_to_talk_key": "space",  # Single char (e.g. "f") or "space"
     # UI toggle states (persisted across sessions)
@@ -77,7 +79,7 @@ _LANGUAGE_STYLE_ADDITIONS = {
     ),
     "wild": (
         "Tone override: Be unpredictable and creative. Feel free to use informal language, slang."
-        "Must use humor, swear words, be inappropriate."
+        "Must use humor, be unprofessional, even inappropriate."
     ),
 }
 
@@ -169,7 +171,7 @@ class Settings:
     def _ensure_dirs(self) -> None:
         for d in (config.DATA_DIR, config.PROFILES_DIR, config.SESSIONS_DIR,
                   config.MEMORIES_DIR, config.CONVERSATIONS_DIR,
-                  config.LOGS_DIR, config.TMP_DIR, config.KB_DIR):
+                  config.LOGS_DIR, config.TMP_DIR):
             os.makedirs(d, exist_ok=True)
 
     # ── App state (settings.json) ────────────────────────────────
@@ -498,12 +500,21 @@ class Settings:
         path = _memory_path(profile_name)
         with self._lock:
             existing = self.load_memories(profile_name)
-            # Simple dedup: skip facts whose text is already a substring of an existing one
             existing_lower = [f.lower() for f in existing]
-            to_add = [
-                f for f in new_facts
-                if f.strip() and f.lower() not in existing_lower
-            ]
+
+            def _is_duplicate(fact: str) -> bool:
+                fl = fact.lower().strip()
+                for ex in existing_lower:
+                    if fl == ex:
+                        return True
+                    # Skip if the new fact is a meaningful substring of an existing one
+                    # (or vice-versa), to avoid near-duplicates like
+                    # "likes coffee" vs "really likes coffee".
+                    if len(fl) > 5 and len(ex) > 5 and (fl in ex or ex in fl):
+                        return True
+                return False
+
+            to_add = [f for f in new_facts if f.strip() and not _is_duplicate(f)]
             if not to_add:
                 return
             combined = existing + to_add
@@ -513,6 +524,20 @@ class Settings:
             _atomic_write(path, {
                 "profile": profile_name,
                 "facts": combined,
+                "updated": datetime.now().isoformat(),
+            })
+
+    def remove_memory(self, profile_name: str, fact: str) -> None:
+        """Remove a single fact from memory. No-op if the fact isn't found."""
+        path = _memory_path(profile_name)
+        with self._lock:
+            existing = self.load_memories(profile_name)
+            updated = [f for f in existing if f != fact]
+            if len(updated) == len(existing):
+                return  # fact not found
+            _atomic_write(path, {
+                "profile": profile_name,
+                "facts": updated,
                 "updated": datetime.now().isoformat(),
             })
 
@@ -556,6 +581,10 @@ class Settings:
         if ptt_key:
             config.PUSH_TO_TALK_KEY = ptt_key
 
+        vision_model = profile.get("vision_model", "").strip()
+        if vision_model:
+            config.VISION_MODEL = vision_model
+
     def _format_system_state(self, runtime_state: Optional[dict] = None) -> str:
         """Return a concise snapshot of runtime configuration for the LLM."""
         state = {
@@ -597,8 +626,8 @@ class Settings:
         user_name = self.get("user_name", "").strip()
         if user_name:
             additions.append(
-                f"The user's name is {user_name}. "
-                f"Address them by name, but only sometimes and in a natural way."
+                f"The user's name is {user_name}. This is definitive — always use {user_name} "
+                f"regardless of any other name that appears in the conversation history."
             )
 
         resp_len = self.get("response_length", "concise")

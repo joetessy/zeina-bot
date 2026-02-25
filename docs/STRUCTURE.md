@@ -26,8 +26,6 @@ Zeina/
 ├── docs/                    # Documentation
 │   ├── STRUCTURE.md         # This file
 │   ├── ARCHITECTURE.md      # System architecture diagram
-│   ├── IMPLEMENTATION_PLAN.md  # Multi-phase evolution roadmap
-│   └── PHASE1_COMPLETE.md   # Phase 1 completion notes
 │
 ├── data/                    # Runtime data — gitignored (sessions, memories, profiles, logs)
 └── venv/                    # Python virtual environment
