@@ -6,6 +6,7 @@ last tool used, and recent event log entries.
 """
 from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.scrollview import ScrollView
 from kivy.uix.textinput import TextInput
 from kivy.uix.label import Label
 from kivy.uix.button import Button
@@ -95,26 +96,50 @@ class DiagnosticsWidget(FloatLayout):
         panel.add_widget(self._tool_lbl[0])
 
         # ── Memory facts ──────────────────────────────────────────
-        panel.add_widget(Label(
+        mem_header_row = BoxLayout(size_hint_y=None, height=24, spacing=8)
+        mem_header_row.add_widget(Label(
             text="Injected memory facts",
             font_size='11sp',
             color=(0.5, 0.55, 0.6, 1),
-            size_hint_y=None,
-            height=20,
+            size_hint_x=1,
             halign='left',
+            valign='middle',
         ))
-        self._memory_log = TextInput(
-            text="(none)",
-            font_size='12sp',
-            readonly=True,
-            foreground_color=(0.72, 0.78, 0.84, 1),
-            background_color=(0.05, 0.06, 0.09, 1),
-            cursor_color=(0, 0, 0, 0),
+        clear_all_btn = Button(
+            text="Clear all",
+            font_size='10sp',
+            size_hint=(None, 1),
+            width=64,
+            background_normal='atlas://data/images/defaulttheme/button',
+            background_color=(0.28, 0.10, 0.10, 1),
+            color=(0.9, 0.55, 0.55, 1),
+        )
+        clear_all_btn.bind(on_release=lambda _: self._clear_all_memories())
+        mem_header_row.add_widget(clear_all_btn)
+        panel.add_widget(mem_header_row)
+
+        # Scroll container for individual deletable fact rows
+        mem_scroll = ScrollView(
             size_hint_y=None,
             height=120,
-            padding=[12, 10],
+            do_scroll_x=False,
         )
-        panel.add_widget(self._memory_log)
+        with mem_scroll.canvas.before:
+            Color(0.05, 0.06, 0.09, 1)
+            self._mem_scroll_bg = Rectangle(pos=mem_scroll.pos, size=mem_scroll.size)
+        mem_scroll.bind(
+            pos=lambda i, v: setattr(self._mem_scroll_bg, 'pos', v),
+            size=lambda i, v: setattr(self._mem_scroll_bg, 'size', v),
+        )
+        self._memory_list = BoxLayout(
+            orientation='vertical',
+            size_hint_y=None,
+            spacing=1,
+            padding=[6, 4],
+        )
+        self._memory_list.bind(minimum_height=self._memory_list.setter('height'))
+        mem_scroll.add_widget(self._memory_list)
+        panel.add_widget(mem_scroll)
 
         # ── Event log ────────────────────────────────────────────
         panel.add_widget(Label(
@@ -174,6 +199,65 @@ class DiagnosticsWidget(FloatLayout):
         row.add_widget(val_lbl)
         return row, val_lbl
 
+    def _build_memory_rows(self, facts, assistant):
+        """Rebuild the memory list with one deletable row per fact."""
+        self._memory_list.clear_widgets()
+
+        if not facts:
+            placeholder = Label(
+                text="(no facts yet)",
+                font_size='12sp',
+                color=(0.45, 0.50, 0.55, 1),
+                size_hint_y=None,
+                height=30,
+                halign='left',
+                valign='middle',
+            )
+            placeholder.bind(size=placeholder.setter('text_size'))
+            self._memory_list.add_widget(placeholder)
+            return
+
+        for fact in facts:
+            row = BoxLayout(size_hint_y=None, height=28, spacing=6)
+            lbl = Label(
+                text=fact,
+                font_size='11sp',
+                color=(0.72, 0.78, 0.84, 1),
+                size_hint_x=1,
+                halign='left',
+                valign='middle',
+            )
+            lbl.bind(size=lbl.setter('text_size'))
+            del_btn = Button(
+                text="×",
+                font_size='14sp',
+                bold=True,
+                size_hint=(None, 1),
+                width=28,
+                background_normal='atlas://data/images/defaulttheme/button',
+                background_color=(0.35, 0.10, 0.10, 1),
+                color=(0.90, 0.50, 0.50, 1),
+            )
+
+            def _make_delete(f=fact, a=assistant):
+                def _on_delete(instance):
+                    if a and hasattr(a, 'settings'):
+                        a.settings.remove_memory(a.settings.active_profile_name, f)
+                    self._repopulate(a)
+                return _on_delete
+
+            del_btn.bind(on_release=_make_delete())
+            row.add_widget(lbl)
+            row.add_widget(del_btn)
+            self._memory_list.add_widget(row)
+
+    def _clear_all_memories(self):
+        """Clear all memories for the active profile."""
+        if self._last_assistant and hasattr(self._last_assistant, 'settings'):
+            a = self._last_assistant
+            a.settings.clear_memories(a.settings.active_profile_name)
+            self._repopulate(a)
+
     def _repopulate(self, assistant):
         """Pull current values from the assistant object."""
         if assistant is None:
@@ -186,14 +270,23 @@ class DiagnosticsWidget(FloatLayout):
             profile = assistant.settings.active_profile_name
             memory_enabled = assistant.settings.get("memory_enabled", True)
             if not memory_enabled:
-                self._memory_log.text = "(memory disabled)"
+                self._memory_list.clear_widgets()
+                placeholder = Label(
+                    text="(memory disabled)",
+                    font_size='12sp',
+                    color=(0.45, 0.50, 0.55, 1),
+                    size_hint_y=None,
+                    height=30,
+                    halign='left',
+                    valign='middle',
+                )
+                placeholder.bind(size=placeholder.setter('text_size'))
+                self._memory_list.add_widget(placeholder)
             else:
                 facts = assistant.settings.load_memories(profile)
-                self._memory_log.text = (
-                    "\n".join(f"• {f}" for f in facts) if facts else "(no facts yet)"
-                )
+                self._build_memory_rows(facts, assistant)
         else:
-            self._memory_log.text = "—"
+            self._memory_list.clear_widgets()
 
         events = list(assistant.event_log)
         self._event_log.text = "\n".join(events) if events else "(no events yet)"

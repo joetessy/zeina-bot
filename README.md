@@ -10,13 +10,56 @@ A voice-activated AI assistant built entirely with open-source tools. Talk natur
 - **Interrupt Anytime**: Push spacebar while Zeina is speaking for instant interruption
 - **Dual Modes**: Voice mode (with TTS) and Chat mode (text only), toggle with TAB
 - **Tool Calling**: Web search, weather, calculator, time, location, file access, system health
+- **Screen Vision**: Ask Zeina what's on your screen — she takes a screenshot, interprets it with a vision model, and responds naturally
 - **Animated Face**: Vector (procedural) and ASCII art animation modes
 - **Settings UI**: Full-screen settings overlay with profiles, themes, and voice control
 - **Model Switching**: Change Ollama models on the fly with Ctrl+M or via settings
 - **Themes**: Default, Midnight, Terminal, Sunset, and Ocean color themes
 - **Profiles**: Multiple named profiles with independent settings and AI context
-- **Diagnostics**: Ctrl+D overlay showing live assistant state and event log
-- **Memories**: Per-profile persistent facts about the user (up to 50 facts)
+- **Diagnostics**: Ctrl+D overlay showing live assistant state, event log, and deletable memories
+- **Memories**: Per-profile persistent facts about the user (up to 50 facts, auto-extracted and deduplicated)
+
+## Screenshots
+
+### Default Theme — Voice Mode
+
+<img src="assets/default_theme_idle.png" width="70%">
+
+*Animated vector face with live expression states. Status bar shows mode, status, and bot name.*
+
+---
+
+### Terminal Theme
+
+<img src="assets/terminal_theme_idle.png" width="70%">
+
+*Green-on-black ASCII-style face. Toggle themes via settings or by voice.*
+
+---
+
+### Chat Mode with Menu Open
+
+<img src="assets/menu_open.png" width="70%">
+
+*The three-dot menu exposes quick toggles: status bar, chat transcript, TTS mute, and settings.*
+
+---
+
+### Settings
+
+<img src="assets/settings_screen.png" width="70%">
+
+*Full settings overlay — models, voice, VAD, themes, profiles, and more. No config file editing needed.*
+
+---
+
+### Diagnostics Overlay
+
+<img src="assets/diagnostics_overlay.png" width="70%">
+
+*Ctrl+D shows live model state, memory facts, and a rolling event log of the session pipeline.*
+
+---
 
 ## Prerequisites
 
@@ -165,6 +208,11 @@ Zeina classifies intent automatically and calls the right tool when needed.
 | **read_file** | "Read my .zshrc", "Show me ~/notes.txt" | File contents (≤ 10 KB, home dir only) |
 | **list_directory** | "What's in my Documents folder?" | Directory listing (dirs first, cap 100) |
 | **get_system_health** | "How's my computer?", "Check CPU usage" | CPU, memory, disk, battery, uptime |
+| **take_screenshot** | "What's on my screen?", "What do you see?", "Read this error" | Captures screen, vision model describes it, main LLM responds |
+| **remember** | "Remember that...", "Don't forget..." | Save a personal fact to long-term memory |
+| **execute_shell** | "Open Safari", "Run ls", "Launch VS Code" | Execute a shell command (requires verbal confirmation) |
+| **read_clipboard** | "What's in my clipboard?", "Read my clipboard" | Read the current clipboard text |
+| **write_clipboard** | "Copy X to clipboard", "Put that in my clipboard" | Write text to the clipboard |
 
 ### Weather Tool Setup
 

@@ -16,5 +16,5 @@ requests
 python-dotenv
 kivy
 psutil
-sentence-transformers
-pypdf
+mss
+Pillow

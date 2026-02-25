@@ -24,6 +24,16 @@ def set_memory_callback(cb) -> None:
     global _memory_callback
     _memory_callback = cb
 
+
+# ── UI control callback (set by app on init) ──────────────────────────────────
+_ui_control_callback = None
+
+
+def set_ui_control_callback(cb) -> None:
+    """Register a callback(action: str, value: str) that controls the app UI."""
+    global _ui_control_callback
+    _ui_control_callback = cb
+
 @dataclass
 class Tool:
     """Represents a tool that the LLM can call"""
@@ -648,14 +658,18 @@ def execute_shell(command: str) -> str:
     if not command:
         return "No command provided."
 
-    # Resolve app name for 'open -a <name>' commands so the user can say the
-    # app's natural name (e.g. "Visual Studio Code") regardless of how the LLM
-    # chose to spell it.
-    open_a_match = re.match(r'^(open\s+-a\s+)([\"\']?)(.+?)\2\s*$', command, re.IGNORECASE)
+    # Resolve app name for 'open -a "AppName" [url]' commands.
+    # Handles both: open -a "AppName"  and  open -a "AppName" "https://..."
+    open_a_match = re.match(
+        r'^open\s+-a\s+([\"\'])(.+?)\1(\s+.+)?\s*$', command, re.IGNORECASE
+    )
     if open_a_match:
-        raw_app = open_a_match.group(3).strip()
+        raw_app  = open_a_match.group(2).strip()
+        trailing = (open_a_match.group(3) or "").strip()
         resolved = _resolve_app_name(raw_app)
-        if resolved != raw_app:
+        if trailing:
+            command = f"open -a '{resolved}' {trailing}"
+        else:
             command = f"open -a '{resolved}'"
 
     # Block obviously dangerous patterns
@@ -764,32 +778,94 @@ def write_clipboard(content: str) -> str:
         return f"Error writing to clipboard: {e}"
 
 
-# ── Knowledge base tool ───────────────────────────────────────────────────────
+# ── Screenshot / vision tool ──────────────────────────────────────────────────
 
 @tool_manager.register(
-    name="query_knowledge_base",
+    name="take_screenshot",
+    description="Capture the current screen for visual analysis.",
+    parameters={"type": "object", "properties": {}, "required": []},
+)
+def take_screenshot() -> str:
+    """Capture the full desktop, save to data/tmp/, return the file path."""
+    import sys
+    from datetime import datetime as _dt
+    from zeina import config as _cfg
+    path = os.path.join(_cfg.TMP_DIR, f"screenshot_{_dt.now().strftime('%Y%m%d_%H%M%S')}.png")
+    os.makedirs(_cfg.TMP_DIR, exist_ok=True)
+
+    if sys.platform == "darwin":
+        # On macOS, mss only captures the Kivy app surface via SDL2.
+        # Use the native screencapture command to get the full desktop.
+        import subprocess
+        result = subprocess.run(
+            ["screencapture", "-x", "-t", "png", path],
+            capture_output=True,
+        )
+        if result.returncode != 0 or not os.path.exists(path):
+            return f"Error: screencapture failed — {result.stderr.decode().strip()}"
+    else:
+        try:
+            import mss
+            import mss.tools
+        except ImportError:
+            return "Error: mss library not installed. Run: pip install mss"
+        with mss.mss() as sct:
+            shot = sct.grab(sct.monitors[1])
+            mss.tools.to_png(shot.rgb, shot.size, output=path)
+
+    return path
+
+
+# ── Self-control tool ─────────────────────────────────────────────────────────
+
+@tool_manager.register(
+    name="control_self",
     description=(
-        "Search the local knowledge base for information stored in personal notes and documents "
-        "inside data/knowledge_base/. Use this when the user asks about something that might be "
-        "in their saved documents, notes, or reference files."
+        "Control the app's own UI and settings. Use when the user asks to: "
+        "switch color theme, change face animation style, toggle voice/chat mode, "
+        "show/hide the status bar or chat feed, show/hide the menu button, "
+        "mute/unmute TTS speech, clear conversation history, clear stored memories, "
+        "change the bot name or user name, switch profile, "
+        "or open the settings or diagnostics page."
     ),
     parameters={
         "type": "object",
         "properties": {
-            "query": {
+            "action": {
                 "type": "string",
-                "description": "What to search for in the knowledge base"
-            }
+                "enum": [
+                    "set_theme", "set_animation", "set_mode",
+                    "set_status_bar", "set_chat_feed", "set_tts_mute",
+                    "clear_history", "clear_memories",
+                    "set_bot_name", "set_user_name",
+                    "open_settings", "open_diagnostics",
+                    "switch_profile", "set_menu_button",
+                ],
+                "description": "The UI action to perform",
+            },
+            "value": {
+                "type": "string",
+                "description": (
+                    "The value for the action. "
+                    "set_theme: default|midnight|terminal|sunset. "
+                    "set_animation: vector|ascii. "
+                    "set_mode: voice|chat. "
+                    "set_status_bar / set_chat_feed / set_menu_button: show|hide. "
+                    "set_tts_mute: mute|unmute. "
+                    "set_bot_name / set_user_name: the new name. "
+                    "switch_profile: the profile name. "
+                    "Other actions: leave empty."
+                ),
+            },
         },
-        "required": ["query"]
-    }
+        "required": ["action"],
+    },
 )
-def query_knowledge_base(query: str) -> str:
-    """Search the local knowledge base using semantic similarity."""
-    try:
-        from zeina.knowledge_base import get_kb
-        return get_kb().search(query)
-    except RuntimeError as e:
-        return str(e)
-    except Exception as e:
-        return f"Knowledge base error: {e}"
+def control_self(action: str, value: str = "") -> str:
+    """Invoke the registered UI control callback to change app state."""
+    if _ui_control_callback:
+        try:
+            return _ui_control_callback(action, value or "")
+        except Exception as e:
+            return f"UI control error: {e}"
+    return "UI control not available in this mode."
