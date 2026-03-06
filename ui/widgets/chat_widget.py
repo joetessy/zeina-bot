@@ -120,8 +120,12 @@ class ChatWidget(BoxLayout):
         kwargs.setdefault('orientation', 'vertical')
         kwargs.setdefault('spacing', 0)
         super().__init__(**kwargs)
+        self._setup_scroll_area()
+        self._setup_input_area()
+        self._setup_state()
 
-        # Message container inside a scroll view, wrapped in anchor for top-pinning
+    def _setup_scroll_area(self):
+        """Create the scrollable message list with top-pinning anchor wrapper."""
         self._scroll = ScrollView(
             do_scroll_x=False,
             bar_width=3,
@@ -149,7 +153,9 @@ class ChatWidget(BoxLayout):
         self._message_box.bind(height=self._sync_anchor_height)
         self.add_widget(self._scroll)
 
-        # Input container with rounded styling (opacity=0 when hidden so canvas doesn't bleed)
+    def _setup_input_area(self):
+        """Create the text input container with rounded background and focus ring."""
+        # Outer container (opacity=0 when hidden so canvas doesn't bleed through)
         self._input_container = BoxLayout(
             size_hint_y=None,
             height=0,
@@ -195,7 +201,7 @@ class ChatWidget(BoxLayout):
             size=self._update_wrapper_bg,
         )
 
-        # Text input field (transparent bg so wrapper shows)
+        # Text input field (transparent bg so wrapper shows through)
         self._input = TextInput(
             hint_text="Enter message...",
             size_hint_y=None,
@@ -218,7 +224,8 @@ class ChatWidget(BoxLayout):
         # Active streaming bubble (set by begin_assistant_stream, cleared on next stream)
         self._stream_bubble = None
 
-        # Threading for blocking get_chat_input
+    def _setup_state(self):
+        """Initialise threading, input coordination, and theme state fields."""
         self._input_event = threading.Event()
         self._input_result = None
         self._waiting_for_input = False
@@ -322,9 +329,8 @@ class ChatWidget(BoxLayout):
     def _on_content_changed(self, *args):
         """Auto-scroll to bottom when content grows (unless user scrolled up)."""
         if self._stick_to_bottom:
-            # Schedule after layout pass to ensure heights are final
-            Clock.schedule_once(self._do_scroll_bottom, 0)
-            Clock.schedule_once(self._do_scroll_bottom, 0.1)
+            # Single deferred call after layout pass ensures heights are final
+            Clock.schedule_once(self._do_scroll_bottom, 0.05)
 
     def _do_scroll_bottom(self, *args):
         self._scroll.scroll_y = 0
@@ -333,7 +339,7 @@ class ChatWidget(BoxLayout):
         self._stick_to_bottom = True
         self._scroll.scroll_y = 0
 
-    def get_chat_input(self, prompt: str) -> str:
+    def get_chat_input(self, prompt: str, timeout: float = 120.0) -> str:
         """Block the calling thread until user submits text. Returns the text or None if cancelled.
         Must NOT be called from the Kivy main thread."""
         self._input_event.clear()
@@ -345,10 +351,10 @@ class ChatWidget(BoxLayout):
         Clock.schedule_once(lambda dt: setattr(self._input, 'hint_text',
                             prompt or "Enter message..."), 0)
 
-        self._input_event.wait()
+        timed_out = not self._input_event.wait(timeout=timeout)
         self._waiting_for_input = False
 
-        if self._input_cancelled:
+        if timed_out or self._input_cancelled:
             return None
 
         return self._input_result

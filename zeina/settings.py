@@ -46,6 +46,8 @@ DEFAULT_PROFILE = {
     "memory_enabled": True,     # Extract and inject facts about the user
     # Vision
     "vision_model": "moondream",    # Vision-capable model for screenshot/screen queries
+    # TTS
+    "tts_speed": 1.0,               # Piper length_scale: <1.0 faster, >1.0 slower
     # Controls
     "push_to_talk_key": "space",  # Single char (e.g. "f") or "space"
     # UI toggle states (persisted across sessions)
@@ -584,6 +586,8 @@ class Settings:
         vision_model = profile.get("vision_model", "").strip()
         if vision_model:
             config.VISION_MODEL = vision_model
+
+        config.TTS_SPEED = float(profile.get("tts_speed", config.TTS_SPEED))
 
     def _format_system_state(self, runtime_state: Optional[dict] = None) -> str:
         """Return a concise snapshot of runtime configuration for the LLM."""

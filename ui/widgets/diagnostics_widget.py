@@ -264,7 +264,7 @@ class DiagnosticsWidget(FloatLayout):
             return
         self._model_lbl[1].text = config.OLLAMA_MODEL
         self._conv_lbl[1].text = f"{len(assistant.conversation_history)} messages"
-        self._tool_lbl[1].text = assistant._last_tool_used or "none"
+        self._tool_lbl[1].text = ", ".join(assistant._last_tools_used) or "none"
 
         if hasattr(assistant, 'settings'):
             profile = assistant.settings.active_profile_name

@@ -66,11 +66,14 @@ class TTSEngine:
         fd, path = tempfile.mkstemp(suffix='.wav', dir=config.TMP_DIR)
         os.close(fd)
 
+        from piper.config import SynthesisConfig
+        length_scale = float(getattr(config, 'TTS_SPEED', 1.0))
+        syn_config = SynthesisConfig(length_scale=length_scale)
         with wave.open(path, 'wb') as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
             wf.setframerate(self.piper_voice.config.sample_rate)
-            for audio_chunk in self.piper_voice.synthesize(text):
+            for audio_chunk in self.piper_voice.synthesize(text, syn_config=syn_config):
                 wf.writeframes(audio_chunk.audio_int16_bytes)
 
         return path

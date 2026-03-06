@@ -9,6 +9,7 @@ from kivy.uix.anchorlayout import AnchorLayout
 from kivy.uix.label import Label
 from kivy.graphics import Color, RoundedRectangle
 from kivy.properties import StringProperty
+from ui.kivy_display import _strip_emoji
 
 
 # Map Rich style names to RGBA
@@ -171,13 +172,13 @@ class StatusWidget(BoxLayout):
     # ── Public setters ────────────────────────────────────────
 
     def set_status(self, message: str, style: str = "cyan"):
-        clean = message.encode('ascii', 'ignore').decode('ascii').strip()
+        clean = _strip_emoji(message)
         self.status_text = clean   # _on_status_text uppercases on display
         self._status_label.color = STYLE_COLORS.get(style, STYLE_COLORS["cyan"])
 
     def set_detail(self, message: str, style: str = "dim"):
         if message.strip():
-            clean = message.encode('ascii', 'ignore').decode('ascii').strip()
+            clean = _strip_emoji(message)
             base = self.status_text.split("  |  ")[0]
             self.status_text = f"{base}  |  {clean}"
         else:
@@ -195,7 +196,7 @@ class StatusWidget(BoxLayout):
     def set_tool_log(self, message: str, style: str = "yellow"):
         if not self._tool_log_enabled:
             return
-        clean = message.encode('ascii', 'ignore').decode('ascii').strip()
+        clean = _strip_emoji(message)
         self.status_text = clean
         self._status_label.color = STYLE_COLORS.get(style, STYLE_COLORS["yellow"])
 

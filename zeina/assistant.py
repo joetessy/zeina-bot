@@ -31,6 +31,13 @@ from zeina.tools import tool_manager, set_memory_callback, set_ui_control_callba
 _OBS_RANK = {"off": 0, "lite": 1, "verbose": 2}
 
 
+def _ui_show_hide(text: str) -> str:
+    """Determine 'show' or 'hide' from natural-language phrasing."""
+    if any(w in text for w in ("show", "open", "on", "enable", "visible")):
+        return "show"
+    return "hide"
+
+
 class ZeinaAssistant:
     """Main assistant orchestrator"""
 
@@ -76,6 +83,7 @@ class ZeinaAssistant:
         self.last_key_press_time = 0
         self.key_debounce_delay = 0.3  # 300ms debounce to prevent accidental double-press
         self.is_speaking = False  # Track if TTS is currently speaking
+        self._speaking_lock = threading.Lock()  # Protect is_speaking across threads
 
         # Track modifier keys for shortcuts
         self.ctrl_pressed = False
@@ -197,6 +205,21 @@ class ZeinaAssistant:
         latest_user = non_system_history[-1]
         return [system_msg] + history_prefix + [state_msg, latest_user]
 
+    def _set_speaking(self, value: bool) -> None:
+        """Thread-safe setter for is_speaking."""
+        with self._speaking_lock:
+            self.is_speaking = value
+
+    def _get_speaking(self) -> bool:
+        """Thread-safe getter for is_speaking."""
+        with self._speaking_lock:
+            return self.is_speaking
+
+    @property
+    def _classifier_model(self) -> str:
+        """Return the intent classifier model, falling back to the main model."""
+        return getattr(config, 'INTENT_CLASSIFIER_MODEL', config.OLLAMA_MODEL)
+
     def refresh_system_prompt(self, reason: Optional[str] = None) -> None:
         """Rebuild the system prompt when runtime configuration changes."""
         if not self.settings:
@@ -216,9 +239,9 @@ class ZeinaAssistant:
             self.audio_recorder.stop()
             self.state = RecordingState.IDLE
         speaking_enabled = getattr(self.display, 'toggles', {}).get('speaking', True)
-        if self.is_speaking and not speaking_enabled:
+        if self._get_speaking() and not speaking_enabled:
             self.tts_engine.stop()
-            self.is_speaking = False
+            self._set_speaking(False)
 
     def _cleanup_chat_mode(self):
         """Clean up chat mode state when switching away"""
@@ -268,14 +291,40 @@ class ZeinaAssistant:
         self.tts_engine = TTSEngine(voice=config.TTS_VOICE)
 
     def _check_ollama_connection(self):
-        """Verify Ollama is running and accessible"""
-        print(f"🧠 Checking Ollama connection...")
+        """Verify Ollama is running, auto-starting it if needed."""
+        print("🧠 Checking Ollama connection...")
         try:
             ollama.list()
             print(f"✓ Connected to Ollama (model: {config.OLLAMA_MODEL})")
+            return
+        except Exception:
+            pass
+
+        # Ollama not running — try to start it
+        print("⏳ Ollama not running, starting it...")
+        try:
+            import subprocess
+            subprocess.Popen(
+                ["ollama", "serve"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            # Wait for it to become available
+            for _ in range(15):
+                time.sleep(1)
+                try:
+                    ollama.list()
+                    print(f"✓ Ollama started (model: {config.OLLAMA_MODEL})")
+                    return
+                except Exception:
+                    continue
+            print("❌ Ollama started but not responding after 15s")
+            sys.exit(1)
+        except FileNotFoundError:
+            print("❌ Ollama is not installed. Install it from https://ollama.com")
+            sys.exit(1)
         except Exception as e:
-            print(f"❌ Error connecting to Ollama: {e}")
-            print("Please ensure Ollama is running: 'ollama serve'")
+            print(f"❌ Failed to start Ollama: {e}")
             sys.exit(1)
 
     def _cleanup_terminal(self):
@@ -443,7 +492,7 @@ class ZeinaAssistant:
         """
         with self.state_lock:
             self.state = new_state
-        self.display.update_face_state(self.state, self.is_speaking)
+        self.display.update_face_state(self.state, self._get_speaking())
 
         # Use mode-specific ready status if no status provided
         if not status and new_state == RecordingState.IDLE:
@@ -684,11 +733,11 @@ class ZeinaAssistant:
             speaking_enabled = getattr(self.display, 'toggles', {}).get('speaking', False)
             if speaking_enabled:
                 self.display.show_status_centered(self.CHAT_SPEAKING_STATUS, "blue")
-                self.is_speaking = True
-                self.display.update_face_state(self.state, self.is_speaking)
+                self._set_speaking(True)
+                self.display.update_face_state(self.state, self._get_speaking())
                 self.tts_engine.speak(assistant_response)
-                self.is_speaking = False
-                self.display.update_face_state(self.state, self.is_speaking)
+                self._set_speaking(False)
+                self.display.update_face_state(self.state, self._get_speaking())
         finally:
             self.set_state(RecordingState.IDLE)
             time.sleep(0.3)
@@ -711,7 +760,7 @@ class ZeinaAssistant:
             self.state = RecordingState.LISTENING
 
             # Update face
-            self.display.update_face_state(self.state, self.is_speaking)
+            self.display.update_face_state(self.state, self._get_speaking())
 
             # Show status centered below face
             self.display.show_status_centered("Listening...", "green")
@@ -752,9 +801,8 @@ class ZeinaAssistant:
         if any(t in m for t in _zeina_screens) and not any(e in m for e in _external):
             return True
 
-        classifier_model = getattr(config, 'INTENT_CLASSIFIER_MODEL', config.OLLAMA_MODEL)
         response = ollama.chat(
-            model=classifier_model,
+            model=self._classifier_model,
             messages=[{
                 "role": "user",
                 "content": (
@@ -844,6 +892,40 @@ class ZeinaAssistant:
                 tools_needed.append('control_self')
                 self._obs("lite", "Intent: control_self")
 
+        # Stage 1.5: Python fast-path for take_screenshot — common phrasings that
+        # the small classifier LLM (3b) often misroutes to "none".
+        if 'take_screenshot' in tool_manager.tools and 'take_screenshot' not in tools_needed:
+            _m = message.lower()
+            _screenshot_triggers = (
+                "what do you see", "what can you see", "what's on my screen",
+                "what is on my screen", "look at my screen", "look at the screen",
+                "whats on my screen", "can you see my screen",
+            )
+            if any(t in _m for t in _screenshot_triggers):
+                tools_needed.append('take_screenshot')
+                self._obs("lite", "Intent: take_screenshot (fast-path)")
+
+        # Stage 1.5b: Python fast-path for get_system_health — hardware/metric terms
+        # that the small classifier LLM (3b) often fails to map to the tool.
+        if 'get_system_health' in tool_manager.tools and 'get_system_health' not in tools_needed:
+            _m = message.lower()
+            _health_triggers = (
+                # Storage
+                "storage space", "disk space", "hard drive", "hard disk", "ssd",
+                "how much space", "free space", "space left", "space remaining",
+                "storage left", "storage remaining",
+                # Battery
+                "battery level", "battery life", "battery percentage", "battery status",
+                "how much battery",
+                # CPU / RAM
+                "cpu usage", "cpu load", "ram usage", "memory usage",
+                # General
+                "system health", "computer health",
+            )
+            if any(t in _m for t in _health_triggers):
+                tools_needed.append('get_system_health')
+                self._obs("lite", "Intent: get_system_health (fast-path)")
+
         # Stage 2: multi-tool classifier — all tools except control_self.
         other_tool_names = [t for t in tool_manager.tools.keys() if t != 'control_self']
         tool_list = ", ".join(other_tool_names)
@@ -863,17 +945,19 @@ class ZeinaAssistant:
         # unless the message explicitly requests something else on top.
         cs_context = ""
         if tools_needed:
+            _cs_actions = [a.get('action', '') for a in (self._pending_control_self_args or []) if a.get('action')]
+            _action_str = (f" ({', '.join(_cs_actions)})" if _cs_actions else "")
             cs_context = (
-                f"NOTE: Zeina's own UI actions (theme, animation, visibility, etc.) have "
-                f"already been identified for this message and are handled separately. "
-                f"Only add tools here if the message ALSO explicitly requests a separate "
-                f"operation such as opening an external app, searching the web, getting the "
-                f"time, etc. If the whole message is about Zeina's own interface, reply 'none'.\n\n"
+                f"NOTE: The message has already been matched to Zeina's own interface "
+                f"controls{_action_str} and will be handled internally — no shell commands "
+                f"or external tools are needed for that part. "
+                f"Only add tools here if the message ALSO explicitly requests something "
+                f"external (open a specific non-Zeina app, search the web, get the time, etc.). "
+                f"If the entire message is about Zeina's own interface, reply 'none'.\n\n"
             )
 
-        classifier_model = getattr(config, 'INTENT_CLASSIFIER_MODEL', config.OLLAMA_MODEL)
         response = ollama.chat(
-            model=classifier_model,
+            model=self._classifier_model,
             messages=[{
                 "role": "user",
                 "content": (
@@ -893,9 +977,14 @@ class ZeinaAssistant:
                     f"- calculate: User wants the answer to a math expression or calculation.\n"
                     f"- get_location: User asks where they are geographically "
                     f"('what city am I in', 'where am I'). NOT for file/directory location.\n"
-                    f"- get_system_health: User asks about computer state: disk space, storage, "
-                    f"battery, CPU/RAM usage, network status, operating system, uptime, "
-                    f"current working directory, or where the app is located on disk.\n"
+                    f"- get_system_health: User asks about the state of their computer hardware "
+                    f"or system metrics. Use for ANY question about: disk/storage space or "
+                    f"fullness ('how full is my drive', 'how much space', 'my SSD', "
+                    f"'running out of space', 'storage left'), battery ('battery level', "
+                    f"'how much battery', 'is it charging'), CPU or RAM ('how fast', "
+                    f"'memory usage', 'cpu load'), network, OS, uptime, or general machine "
+                    f"health ('how's my computer', 'is my computer slow'). "
+                    f"Use whenever the question is about the user's own machine state.\n"
                     f"- read_file: User wants to read the contents of a specific file.\n"
                     f"- list_directory: User wants a list of files inside a folder.\n"
                     f"- remember: User explicitly asks to save/remember a fact about themselves "
@@ -906,12 +995,15 @@ class ZeinaAssistant:
                     f"Trigger: imperative verb ('open', 'launch', 'run', 'start', 'kill', "
                     f"'close') + specific target app/URL/command. "
                     f"NOT for: 'I wonder if...', 'should I...', 'can you...', 'what if...', "
-                    f"'give you the ability to...', discussions about what Zeina could do.\n"
+                    f"'give you the ability to...', discussions about what Zeina could do. "
+                    f"NOT for system metrics queries (battery, disk, CPU, RAM, storage) — "
+                    f"use get_system_health for those instead.\n"
                     f"- read_clipboard: User wants to read what is currently in the clipboard.\n"
                     f"- write_clipboard: User wants to copy specific text to the clipboard.\n"
                     f"- take_screenshot: User asks about something on their screen, wants you to "
                     f"look at / read / describe screen content "
-                    f"('what do you see', 'look at this', 'what's on my screen').\n"
+                    f"('what do you see', 'look at this', 'what's on my screen'). "
+                    f"NEVER repeat take_screenshot — one screenshot per request.\n"
                     f"- none: Everything else. Use this for: greetings, casual chat, general "
                     f"knowledge questions, hypothetical/capability discussions ('I wonder if', "
                     f"'should I', 'can you', 'what if', 'what tools do you have'), "
@@ -931,10 +1023,13 @@ class ZeinaAssistant:
             t = token.strip().replace('.', '').replace('"', '').replace("'", '')
             if t and t != 'none' and t in other_tool_names:
                 stage2_tools.append(t)
+        # take_screenshot should never be duplicated (fast-path may have already added it)
+        stage2_tools = [t for t in stage2_tools
+                        if t != 'take_screenshot' or 'take_screenshot' not in tools_needed]
         if stage2_tools:
-            self._obs("lite", f"Intent [{classifier_model}]: {', '.join(stage2_tools)}")
+            self._obs("lite", f"Intent [{self._classifier_model}]: {', '.join(stage2_tools)}")
         else:
-            self._obs("lite", f"Intent [{classifier_model}]: none")
+            self._obs("lite", f"Intent [{self._classifier_model}]: none")
         tools_needed.extend(stage2_tools)
         return tools_needed
 
@@ -964,9 +1059,8 @@ class ZeinaAssistant:
             lines.append(f"{role}: {m['content']}")
         context = "\n".join(lines)
 
-        classifier_model = getattr(config, 'INTENT_CLASSIFIER_MODEL', config.OLLAMA_MODEL)
         response = ollama.chat(
-            model=classifier_model,
+            model=self._classifier_model,
             messages=[{
                 "role": "user",
                 "content": (
@@ -987,198 +1081,144 @@ class ZeinaAssistant:
             return resolved
         return message
 
-    def _extract_ui_action(self, message: str) -> dict:
-        """Parse action + value for control_self directly from the message text.
+    def _match_ui_patterns(self, m: str, message: str, multi: bool) -> list[dict]:
+        """Shared pattern matching core for UI control actions.
+
+        Args:
+            m: pre-lowercased message text.
+            message: original casing, used for LLM name/profile extraction.
+            multi: True = collect all matches; False = return after first match.
 
         Routing to control_self is the LLM's job (stage-1 classifier).
-        Extracting structure from a known intent category is a parsing job —
-        Python is faster and more reliable here than asking the small model
-        to generate JSON.
-
-        Falls back to an LLM call only for open-ended name extraction.
+        Extracting structure is a parsing job — Python is faster and more
+        reliable than asking the small model to generate JSON.
+        Falls back to LLM only for open-ended name extraction.
         """
-        m = message.lower()
+        results: list[dict] = []
 
-        def _show_hide(text):
-            if any(w in text for w in ("show", "open", "on", "enable", "visible")):
-                return "show"
-            return "hide"
+        def _emit(action_dict: dict) -> bool:
+            """Append result. Returns True when caller should stop (single mode)."""
+            results.append(action_dict)
+            return not multi
 
         # ── Theme ────────────────────────────────────────────────────────
         for theme in ("midnight", "terminal", "sunset", "default"):
             if theme in m:
-                return {"action": "set_theme", "value": theme}
+                if _emit({"action": "set_theme", "value": theme}):
+                    return results
+                break  # only one theme at a time
 
-        # ── Animation ────────────────────────────────────────────────────
+        # ── Animation (mutually exclusive) ───────────────────────────────
         if "ascii" in m:
-            return {"action": "set_animation", "value": "ascii"}
-        if "vector" in m or "bmo" in m:
-            return {"action": "set_animation", "value": "vector"}
-        # Toggle when the user says "switch/change face style" without specifying which
-        if any(w in m for w in ("face style", "face animation", "animation style",
-                                "switch animation", "change animation", "switch face",
-                                "change face", "switch ur face", "change ur face")):
-            return {"action": "set_animation", "value": "toggle"}
+            if _emit({"action": "set_animation", "value": "ascii"}):
+                return results
+        elif "vector" in m or "bmo" in m:
+            if _emit({"action": "set_animation", "value": "vector"}):
+                return results
+        elif any(w in m for w in ("face style", "face animation", "animation style",
+                                  "switch animation", "change animation", "switch face",
+                                  "change face", "switch ur face", "change ur face")):
+            if _emit({"action": "set_animation", "value": "toggle"}):
+                return results
 
-        # ── Mode ─────────────────────────────────────────────────────────
+        # ── Mode (mutually exclusive) ─────────────────────────────────────
         # Require "mode" or an explicit imperative verb — bare "voice" is too broad
         # (e.g. "I love your voice" should NOT route here).
         if any(p in m for p in ("voice mode", "switch to voice", "go to voice",
                                 "use voice", "activate voice", "voice input")):
-            return {"action": "set_mode", "value": "voice"}
-        if any(w in m for w in ("chat mode", "text mode", "chat input", "switch to chat",
-                                "go to chat", "typing mode")):
-            return {"action": "set_mode", "value": "chat"}
+            if _emit({"action": "set_mode", "value": "voice"}):
+                return results
+        elif any(w in m for w in ("chat mode", "text mode", "chat input", "switch to chat",
+                                  "go to chat", "typing mode")):
+            if _emit({"action": "set_mode", "value": "chat"}):
+                return results
 
         # ── Pages ────────────────────────────────────────────────────────
         if "setting" in m:
-            return {"action": "open_settings"}
+            if _emit({"action": "open_settings"}):
+                return results
         if "diagnostic" in m or "dashboard" in m:
-            return {"action": "open_diagnostics"}
+            if _emit({"action": "open_diagnostics"}):
+                return results
 
         # ── Clear ────────────────────────────────────────────────────────
         _clear_words = ("clear", "wipe", "reset", "delete", "erase", "forget")
         if any(w in m for w in _clear_words):
             if any(w in m for w in ("histor", "conversation", "chat", "messages")):
-                return {"action": "clear_history"}
+                if _emit({"action": "clear_history"}):
+                    return results
             if any(w in m for w in ("memor", "everything", "all")):
-                return {"action": "clear_memories"}
+                if _emit({"action": "clear_memories"}):
+                    return results
 
         # ── Status bar ───────────────────────────────────────────────────
         if "status bar" in m or ("status" in m and "bar" in m):
-            return {"action": "set_status_bar", "value": _show_hide(m)}
+            if _emit({"action": "set_status_bar", "value": _ui_show_hide(m)}):
+                return results
 
         # ── Chat feed / transcript ────────────────────────────────────────
         if any(w in m for w in ("chat feed", "chat window", "transcript",
                                 "show chat", "hide chat", "open chat", "close chat")):
-            return {"action": "set_chat_feed", "value": _show_hide(m)}
+            if _emit({"action": "set_chat_feed", "value": _ui_show_hide(m)}):
+                return results
 
-        # ── TTS mute ─────────────────────────────────────────────────────
+        # ── TTS mute (mutually exclusive) ─────────────────────────────────
         if "unmute" in m:
-            return {"action": "set_tts_mute", "value": "unmute"}
-        if "mute" in m:
-            return {"action": "set_tts_mute", "value": "mute"}
+            if _emit({"action": "set_tts_mute", "value": "unmute"}):
+                return results
+        elif "mute" in m:
+            if _emit({"action": "set_tts_mute", "value": "mute"}):
+                return results
 
         # ── Profile switching (open-ended name → LLM) ────────────────────
         # Require an imperative verb — "my LinkedIn profile" should not match.
         _profile_verbs = ("switch", "change", "go to", "use", "load",
                           "activate", "select", "swap")
         if "profile" in m and any(v in m for v in _profile_verbs):
-            return {"action": "switch_profile", "value": self._extract_name(message)}
+            if _emit({"action": "switch_profile", "value": self._extract_name(message)}):
+                return results
 
         # ── Menu button ───────────────────────────────────────────────────
         _menu_words = ("3 dot", "three dot", "dots menu", "menu button",
                        "dot menu", "3dot", "triple dot")
         if any(w in m for w in _menu_words) or ("menu" in m and "button" in m):
-            return {"action": "set_menu_button", "value": _show_hide(m)}
+            if _emit({"action": "set_menu_button", "value": _ui_show_hide(m)}):
+                return results
 
         # ── Names (open-ended → LLM) ──────────────────────────────────────
         # Use imperative-only patterns — "what's your name?" should NOT match.
         if any(w in m for w in ("call you", "rename you", "your name to",
                                 "change your name", "bot name")):
-            return {"action": "set_bot_name", "value": self._extract_name(message)}
+            if _emit({"action": "set_bot_name", "value": self._extract_name(message)}):
+                return results
         if any(w in m for w in ("call me", "my name is", "user name is",
                                 "set my name")):
-            return {"action": "set_user_name", "value": self._extract_name(message)}
+            if _emit({"action": "set_user_name", "value": self._extract_name(message)}):
+                return results
 
+        return results
+
+    def _extract_ui_action(self, message: str) -> dict:
+        """Return the first matched UI control action for this message."""
+        results = self._match_ui_patterns(message.lower(), message, multi=False)
+        if results:
+            return results[0]
         self._obs("verbose", f"control_self: no action matched for: {message}")
         return {"action": "", "value": ""}
 
     def _extract_ui_actions_multi(self, message: str) -> list[dict]:
-        """Collect ALL control_self actions from a single message.
+        """Collect ALL UI control actions from a single message.
 
-        Unlike _extract_ui_action (which stops at the first match), this runs
-        every pattern check and returns a list so multi-action requests like
-        'hide the status bar and change theme to midnight' produce two entries.
+        Runs every pattern check and returns a list so multi-action requests
+        like 'hide the status bar and change theme to midnight' produce two
+        entries.
         """
-        m = message.lower()
-        results: list[dict] = []
-
-        def _show_hide(text: str) -> str:
-            if any(w in text for w in ("show", "open", "on", "enable", "visible")):
-                return "show"
-            return "hide"
-
-        # ── Theme ────────────────────────────────────────────────────────
-        for theme in ("midnight", "terminal", "sunset", "default"):
-            if theme in m:
-                results.append({"action": "set_theme", "value": theme})
-                break  # only one theme at a time
-
-        # ── Animation ────────────────────────────────────────────────────
-        if "ascii" in m:
-            results.append({"action": "set_animation", "value": "ascii"})
-        elif "vector" in m or "bmo" in m:
-            results.append({"action": "set_animation", "value": "vector"})
-        elif any(w in m for w in ("face style", "face animation", "animation style",
-                                  "switch animation", "change animation", "switch face",
-                                  "change face", "switch ur face", "change ur face")):
-            results.append({"action": "set_animation", "value": "toggle"})
-
-        # ── Mode ─────────────────────────────────────────────────────────
-        if any(p in m for p in ("voice mode", "switch to voice", "go to voice",
-                                "use voice", "activate voice", "voice input")):
-            results.append({"action": "set_mode", "value": "voice"})
-        elif any(w in m for w in ("chat mode", "text mode", "chat input", "switch to chat",
-                                  "go to chat", "typing mode")):
-            results.append({"action": "set_mode", "value": "chat"})
-
-        # ── Pages ────────────────────────────────────────────────────────
-        if "setting" in m:
-            results.append({"action": "open_settings"})
-        if "diagnostic" in m or "dashboard" in m:
-            results.append({"action": "open_diagnostics"})
-
-        # ── Clear ────────────────────────────────────────────────────────
-        _clear_words = ("clear", "wipe", "reset", "delete", "erase", "forget")
-        if any(w in m for w in _clear_words):
-            if any(w in m for w in ("histor", "conversation", "chat", "messages")):
-                results.append({"action": "clear_history"})
-            if any(w in m for w in ("memor", "everything", "all")):
-                results.append({"action": "clear_memories"})
-
-        # ── Status bar ───────────────────────────────────────────────────
-        if "status bar" in m or ("status" in m and "bar" in m):
-            results.append({"action": "set_status_bar", "value": _show_hide(m)})
-
-        # ── Chat feed / transcript ────────────────────────────────────────
-        if any(w in m for w in ("chat feed", "chat window", "transcript",
-                                "show chat", "hide chat", "open chat", "close chat")):
-            results.append({"action": "set_chat_feed", "value": _show_hide(m)})
-
-        # ── TTS mute ─────────────────────────────────────────────────────
-        if "unmute" in m:
-            results.append({"action": "set_tts_mute", "value": "unmute"})
-        elif "mute" in m:
-            results.append({"action": "set_tts_mute", "value": "mute"})
-
-        # ── Profile ──────────────────────────────────────────────────────
-        _profile_verbs = ("switch", "change", "go to", "use", "load",
-                          "activate", "select", "swap")
-        if "profile" in m and any(v in m for v in _profile_verbs):
-            results.append({"action": "switch_profile", "value": self._extract_name(message)})
-
-        # ── Menu button ──────────────────────────────────────────────────
-        _menu_words = ("3 dot", "three dot", "dots menu", "menu button",
-                       "dot menu", "3dot", "triple dot")
-        if any(w in m for w in _menu_words) or ("menu" in m and "button" in m):
-            results.append({"action": "set_menu_button", "value": _show_hide(m)})
-
-        # ── Names ────────────────────────────────────────────────────────
-        if any(w in m for w in ("call you", "rename you", "your name to",
-                                "change your name", "bot name")):
-            results.append({"action": "set_bot_name", "value": self._extract_name(message)})
-        if any(w in m for w in ("call me", "my name is", "user name is",
-                                "set my name")):
-            results.append({"action": "set_user_name", "value": self._extract_name(message)})
-
-        return results
+        return self._match_ui_patterns(message.lower(), message, multi=True)
 
     def _extract_name(self, message: str) -> str:
         """Use the classifier LLM to pull a proper name out of a message."""
-        classifier_model = getattr(config, 'INTENT_CLASSIFIER_MODEL', config.OLLAMA_MODEL)
         response = ollama.chat(
-            model=classifier_model,
+            model=self._classifier_model,
             messages=[{
                 "role": "user",
                 "content": (
@@ -1197,9 +1237,8 @@ class ZeinaAssistant:
     def _extract_clipboard_content(self, message: str) -> str:
         """Use the classifier LLM to extract what the user wants written to the clipboard.
         Vague references are already resolved by _resolve_references before this is called."""
-        classifier_model = getattr(config, 'INTENT_CLASSIFIER_MODEL', config.OLLAMA_MODEL)
         response = ollama.chat(
-            model=classifier_model,
+            model=self._classifier_model,
             messages=[{
                 "role": "user",
                 "content": (
@@ -1221,9 +1260,8 @@ class ZeinaAssistant:
     def _extract_shell_command(self, message: str) -> str:
         """Use the classifier LLM to extract a shell command from a natural language request.
         Vague references are already resolved by _resolve_references before this is called."""
-        classifier_model = getattr(config, 'INTENT_CLASSIFIER_MODEL', config.OLLAMA_MODEL)
         response = ollama.chat(
-            model=classifier_model,
+            model=self._classifier_model,
             messages=[{
                 "role": "user",
                 "content": (
@@ -1261,9 +1299,8 @@ class ZeinaAssistant:
         Returns a list of command strings. Falls back to a single command if
         the LLM doesn't return valid JSON.
         """
-        classifier_model = getattr(config, 'INTENT_CLASSIFIER_MODEL', config.OLLAMA_MODEL)
         response = ollama.chat(
-            model=classifier_model,
+            model=self._classifier_model,
             messages=[{
                 "role": "user",
                 "content": (
@@ -1362,8 +1399,6 @@ class ZeinaAssistant:
 
     def _extract_fact(self, message: str) -> str:
         """Extract the fact the user wants remembered from their message."""
-        classifier_model = getattr(config, 'INTENT_CLASSIFIER_MODEL', config.OLLAMA_MODEL)
-
         # Build existing-memory context so the LLM can normalise consistently
         existing_block = ""
         if self.settings:
@@ -1376,7 +1411,7 @@ class ZeinaAssistant:
                 )
 
         response = ollama.chat(
-            model=classifier_model,
+            model=self._classifier_model,
             messages=[{
                 "role": "user",
                 "content": (
@@ -1401,9 +1436,8 @@ class ZeinaAssistant:
 
     def _extract_path(self, message: str) -> str:
         """Use the classifier LLM to extract a file or directory path from a natural language request."""
-        classifier_model = getattr(config, 'INTENT_CLASSIFIER_MODEL', config.OLLAMA_MODEL)
         response = ollama.chat(
-            model=classifier_model,
+            model=self._classifier_model,
             messages=[{
                 "role": "user",
                 "content": (
@@ -1423,9 +1457,8 @@ class ZeinaAssistant:
     def _extract_location(self, message: str) -> str:
         """Extract a location name from a user message for weather queries.
         Uses a fast LLM call to reliably pull out the city/location."""
-        classifier_model = getattr(config, 'INTENT_CLASSIFIER_MODEL', config.OLLAMA_MODEL)
         response = ollama.chat(
-            model=classifier_model,
+            model=self._classifier_model,
             messages=[{
                 "role": "user",
                 "content": (
@@ -1467,9 +1500,8 @@ class ZeinaAssistant:
             for m in to_summarize
         )
         try:
-            classifier_model = getattr(config, 'INTENT_CLASSIFIER_MODEL', config.OLLAMA_MODEL)
             resp = ollama.chat(
-                model=classifier_model,
+                model=self._classifier_model,
                 messages=[{
                     "role": "user",
                     "content": (
@@ -1494,6 +1526,89 @@ class ZeinaAssistant:
         # Fallback: plain truncation
         self.conversation_history = [self.conversation_history[0]] + \
             self.conversation_history[-(config.MAX_CONVERSATION_LENGTH):]
+
+    def _inject_tool_results(
+        self,
+        tool_results: list,
+        tools_needed: list,
+        user_message: str,
+    ) -> None:
+        """Inject tool execution results into conversation_history as user messages.
+
+        Handles the take_screenshot / vision pipeline separately from regular tools.
+        After this call, conversation_history is ready for the main LLM step.
+        """
+        _ACTION_TOOLS = {"control_self", "execute_shell", "computer_control", "remember", "write_clipboard"}
+
+        # ── Screenshot (vision pipeline) ─────────────────────────────────
+        screenshot_result = next(
+            ((n, r) for n, r in tool_results if n == "take_screenshot"), None
+        )
+        if screenshot_result:
+            vision_description = self._handle_vision_query(screenshot_result[1], user_message)
+            if vision_description:
+                injection_content = (
+                    f"[I looked at the user's screen. Here is what I see:]\n"
+                    f"{vision_description}\n\n"
+                    f"Describe what you see on the screen to the user in a natural, "
+                    f"conversational way. Tell them what's actually on the screen — "
+                    f"don't just say you took a screenshot. Their question: {user_message}"
+                )
+            else:
+                injection_content = (
+                    f"You tried to look at the user's screen but the capture failed. "
+                    f"Let them know you couldn't see the screen and ask them to try again."
+                )
+            self.conversation_history.append({"role": "user", "content": injection_content})
+
+        # ── All other tools ───────────────────────────────────────────────
+        other_results = [(n, r) for n, r in tool_results if n != "take_screenshot"]
+        if not other_results:
+            return
+
+        if len(other_results) == 1:
+            tool_name, tool_result = other_results[0]
+            if tool_name in _ACTION_TOOLS:
+                injection_content = (
+                    f"[You just completed this action: {tool_result}] "
+                    f"Acknowledge it briefly and naturally to the user. "
+                    f"Their request was: {user_message}"
+                )
+            else:
+                injection_content = (
+                    f"[Result]\n{tool_result}\n\n"
+                    f"Using the result above, answer this naturally: {user_message}"
+                )
+        else:
+            # Multiple tools — build a combined block.
+            action_lines: list[str] = []
+            info_sections: list[str] = []
+            for tool_name, tool_result in other_results:
+                if tool_name in _ACTION_TOOLS:
+                    action_lines.append(f"- {tool_result}")
+                else:
+                    info_sections.append(f"[{tool_name} result]\n{tool_result}")
+
+            parts: list[str] = []
+            if action_lines:
+                parts.append("[Actions completed:\n" + "\n".join(action_lines) + "]")
+            if info_sections:
+                parts.append("\n\n".join(info_sections))
+
+            combined = "\n\n".join(parts)
+            if action_lines and not info_sections:
+                injection_content = (
+                    f"{combined}\n\n"
+                    f"Acknowledge all completed actions briefly and naturally in one "
+                    f"response. Their request was: {user_message}"
+                )
+            else:
+                injection_content = (
+                    f"{combined}\n\n"
+                    f"Using the above results, respond naturally to: {user_message}"
+                )
+
+        self.conversation_history.append({"role": "user", "content": injection_content})
 
     def _get_llm_response(self, user_message: str, show_detail: bool = True,
                           voice_streaming: bool = False) -> str:
@@ -1555,73 +1670,7 @@ class ZeinaAssistant:
                 tool_results.append((tool_name, tool_result))
 
             # Step 2b: Inject results into conversation history.
-            _ACTION_TOOLS = {"control_self", "execute_shell", "computer_control", "remember", "write_clipboard"}
-
-            # Handle take_screenshot specially (vision pipeline).
-            screenshot_result = next(
-                ((n, r) for n, r in tool_results if n == "take_screenshot"), None
-            )
-            if screenshot_result:
-                vision_description = self._handle_vision_query(screenshot_result[1], user_message)
-                if vision_description:
-                    injection_content = (
-                        f"[I am currently looking at the user's screen and this is what I can see]\n"
-                        f"{vision_description}\n\n"
-                        f"Using what I can see right now, respond to: {user_message}"
-                    )
-                else:
-                    injection_content = (
-                        f"You tried to look at the user's screen but the capture failed. "
-                        f"Let them know you couldn't see the screen and ask them to try again."
-                    )
-                self.conversation_history.append({"role": "user", "content": injection_content})
-
-            # Build combined injection for all non-screenshot tools.
-            other_results = [(n, r) for n, r in tool_results if n != "take_screenshot"]
-            if other_results:
-                if len(other_results) == 1:
-                    tool_name, tool_result = other_results[0]
-                    if tool_name in _ACTION_TOOLS:
-                        injection_content = (
-                            f"[You just completed this action: {tool_result}] "
-                            f"Acknowledge it briefly and naturally to the user. "
-                            f"Their request was: {user_message}"
-                        )
-                    else:
-                        injection_content = (
-                            f"[Result]\n{tool_result}\n\n"
-                            f"Using the result above, answer this naturally: {user_message}"
-                        )
-                else:
-                    # Multiple tools — build a combined block.
-                    action_lines: list[str] = []
-                    info_sections: list[str] = []
-                    for tool_name, tool_result in other_results:
-                        if tool_name in _ACTION_TOOLS:
-                            action_lines.append(f"- {tool_result}")
-                        else:
-                            info_sections.append(f"[{tool_name} result]\n{tool_result}")
-
-                    parts: list[str] = []
-                    if action_lines:
-                        parts.append("[Actions completed:\n" + "\n".join(action_lines) + "]")
-                    if info_sections:
-                        parts.append("\n\n".join(info_sections))
-
-                    combined = "\n\n".join(parts)
-                    if action_lines and not info_sections:
-                        injection_content = (
-                            f"{combined}\n\n"
-                            f"Acknowledge all completed actions briefly and naturally in one "
-                            f"response. Their request was: {user_message}"
-                        )
-                    else:
-                        injection_content = (
-                            f"{combined}\n\n"
-                            f"Using the above results, respond naturally to: {user_message}"
-                        )
-
-                self.conversation_history.append({"role": "user", "content": injection_content})
+            self._inject_tool_results(tool_results, tools_needed, user_message)
 
             self._last_turn_had_tool_call = True
             self._last_tools_used = tools_needed
@@ -1663,23 +1712,21 @@ class ZeinaAssistant:
         if not messages_for_call:
             messages_for_call = list(self.conversation_history)
 
-        if voice_streaming and hasattr(self, 'tts_engine') and self.tts_engine and "control_self" not in tools_needed:
+        # Re-check the speaking toggle after tool execution — a control_self mute action
+        # updates toggles['speaking'] synchronously in _handle_ui_control, so this
+        # correctly reflects the new state before we decide whether to use TTS.
+        speaking_after_tools = getattr(self.display, 'toggles', {}).get('speaking', True)
+        if voice_streaming and hasattr(self, 'tts_engine') and self.tts_engine and speaking_after_tools:
             # Voice mode: stream tokens to display + speak each sentence as it arrives.
-            # control_self is excluded — its actions (e.g. mute) take effect
-            # asynchronously via Clock, so the toggle state is stale when
-            # begin_stream runs. Force face_stream_mode so the response text
-            # is always visible regardless of chat/TTS state.
             t0 = time.monotonic()
             content = self._stream_and_speak(messages_for_call)
             elapsed = time.monotonic() - t0
         else:
-            # Force face stream for control_self only when TTS is muted —
-            # that's when the user would otherwise get no visible feedback.
-            # If TTS is on (e.g. unmute response), let normal streaming handle it.
-            if "control_self" in tools_needed and hasattr(self.display, '_force_face_stream'):
-                tts_muted = not self.display.toggles.get('speaking', True)
+            # TTS is off (muted or not in voice mode) — show text on face when
+            # chat is also hidden so the user gets some visible feedback.
+            if hasattr(self.display, '_force_face_stream') and not speaking_after_tools:
                 chat_visible = self.display.toggles.get('chat', True)
-                self.display._force_face_stream = tts_muted and not chat_visible
+                self.display._force_face_stream = not chat_visible
             content, elapsed = _do_llm_call(messages_for_call, start_bubble=True)
 
             # Guard against empty responses - retry once without tool context
@@ -1820,7 +1867,6 @@ class ZeinaAssistant:
 
         try:
             profile = self.settings.active_profile_name
-            self._obs("lite", f"Memory extraction [{config.OLLAMA_MODEL}]")
             existing = self.settings.load_memories(profile)
             existing_block = ""
             if existing:
@@ -1850,7 +1896,9 @@ class ZeinaAssistant:
                         "  • Beliefs, values, identity\n\n"
                         "Rules:\n"
                         "- Only extract what the user explicitly stated. No stereotypes or inferences.\n"
-                        "- Rephrase in third person, dropping 'I': store 'likes cheese', not 'I like cheese'.\n"
+                        "- NEVER start with 'The user' or 'User'. Drop ALL subjects. "
+                        "Examples: 'likes cheese' (correct), 'The user likes cheese' (WRONG), "
+                        "'identifies as a marxist' (correct), 'The user identifies as a marxist' (WRONG).\n"
                         "- Skip style inferences about how they communicate — extract content, not tone.\n"
                         "- Skip one-off requests, fleeting tasks, and facts about other people.\n"
                         "- Skip already-known facts listed below.\n\n"
@@ -1873,16 +1921,17 @@ class ZeinaAssistant:
                 clean_facts = []
                 for entry in records:
                     if isinstance(entry, str) and entry.strip():
-                        clean_facts.append(entry.strip())
+                        fact = entry.strip()
+                        # Strip "The user" / "User" prefix if model ignores instructions
+                        for prefix in ("The user ", "the user ", "User ", "user "):
+                            if fact.startswith(prefix):
+                                fact = fact[len(prefix):]
+                                break
+                        clean_facts.append(fact)
                 if clean_facts:
                     self.settings.append_memories(profile, clean_facts)
                     self._obs("lite", f"Memories stored: {clean_facts}")
-                    # Flash a brief notification in the status bar
-                    preview = clean_facts[0]
-                    if len(preview) > 42:
-                        preview = preview[:42] + "..."
-                    suffix = f" (+{len(clean_facts) - 1} more)" if len(clean_facts) > 1 else ""
-                    self.display.show_log(f"Memory saved: {preview}{suffix}")
+                    self.display.show_log("Memory saved")
         except Exception as e:
             self._obs("lite", f"Memory extraction error: {e}")
 
@@ -1967,8 +2016,8 @@ class ZeinaAssistant:
 
         # Audio is about to start — only NOW set is_speaking so PTT correctly
         # triggers an interrupt during playback rather than during LLM computation.
-        self.is_speaking = True
-        self.display.update_face_state(self.state, self.is_speaking)
+        self._set_speaking(True)
+        self.display.update_face_state(self.state, self._get_speaking())
 
         # Drain the play queue
         play_q.put(None)
@@ -1990,7 +2039,7 @@ class ZeinaAssistant:
         """Return True if the user has pressed spacebar to interrupt (is_speaking was cleared)."""
         # The TTS engine's stop() sets is_speaking=False on the engine; the pipeline
         # thread's self.is_speaking flag is used as the interrupt signal.
-        return not self.is_speaking
+        return not self._get_speaking()
 
     def process_audio_pipeline(self):
         """
@@ -2034,8 +2083,8 @@ class ZeinaAssistant:
             if speaking_enabled and hasattr(self, 'tts_engine') and self.tts_engine:
                 self.display.show_status_centered(self.SPEAKING_STATUS, "blue")
                 assistant_response = self._get_llm_response(transcription, voice_streaming=True)
-                self.is_speaking = False
-                self.display.update_face_state(self.state, self.is_speaking)
+                self._set_speaking(False)
+                self.display.update_face_state(self.state, self._get_speaking())
             else:
                 assistant_response = self._get_llm_response(transcription)
 
@@ -2115,9 +2164,9 @@ class ZeinaAssistant:
                 self.last_key_press_time = current_time
 
                 # Interrupt TTS if speaking
-                if self.is_speaking:
+                if self._get_speaking():
                     self.tts_engine.stop()
-                    self.is_speaking = False
+                    self._set_speaking(False)
                     self.set_state(RecordingState.IDLE)
                     self.start_listening(mode="interrupt")
 

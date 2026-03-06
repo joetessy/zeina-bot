@@ -61,6 +61,7 @@ MODE_TOGGLE_KEY = "tab"  # Key to toggle between voice and chat mode
 # Text-to-Speech
 TTS_ENGINE = "piper"  # Using Piper TTS for natural voice
 TTS_VOICE = os.path.join(PROJECT_ROOT, "models", "en_GB-southern_english_female-low.onnx")  # Piper voice model file
+TTS_SPEED = 1.0  # Speech rate: <1.0 faster, >1.0 slower (Piper length_scale)
 
 # Voice Activity Detection - Auto-detects when you stop speaking
 VAD_THRESHOLD = 0.5  # How confident VAD must be (0-1)

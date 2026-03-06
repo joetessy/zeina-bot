@@ -8,6 +8,11 @@ from zeina.enums import InteractionMode, RecordingState
 from typing import Optional
 
 
+def _strip_emoji(text: str) -> str:
+    """Strip non-ASCII characters (emojis) that Kivy can't render."""
+    return text.encode('ascii', 'ignore').decode('ascii').strip()
+
+
 class KivyDisplay:
     """Display backend that routes updates to Kivy widgets via Clock.schedule_once."""
 
@@ -37,12 +42,6 @@ class KivyDisplay:
         self._persistent_style = "cyan"
         self._log_restore_event = None   # Pending Clock event to restore status
 
-    # --- Helpers ---
-
-    def _strip_emoji(self, text: str) -> str:
-        """Strip non-ASCII characters (emojis) that Kivy can't render."""
-        return text.encode('ascii', 'ignore').decode('ascii').strip()
-
     # --- Display protocol methods ---
 
     def show_status(self, status: str, style: str = ""):
@@ -66,7 +65,7 @@ class KivyDisplay:
         self.chat_widget.add_message(message, role="assistant")
 
     def show_error(self, message: str):
-        clean = self._strip_emoji(message)
+        clean = _strip_emoji(message)
         if self.toggles.get('tool_log', True):
             def _update(dt):
                 self.status_widget.set_tool_log(clean, "red")
@@ -74,7 +73,7 @@ class KivyDisplay:
         self.chat_widget.add_message(clean, role="error")
 
     def show_info(self, message: str):
-        clean = self._strip_emoji(message)
+        clean = _strip_emoji(message)
         if self.toggles.get('tool_log', True):
             def _update(dt):
                 self.status_widget.set_tool_log(clean, "yellow")
@@ -175,7 +174,7 @@ class KivyDisplay:
         """Show a log message in the status bar (not in chat bubbles).
         Auto-clears after 1.5 s and restores the previous persistent status."""
         if self.toggles.get('tool_log', True):
-            clean = self._strip_emoji(message)
+            clean = _strip_emoji(message)
             def _update(dt):
                 if self._log_restore_event:
                     self._log_restore_event.cancel()

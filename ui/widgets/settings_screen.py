@@ -331,11 +331,15 @@ class SettingsScreen(FloatLayout):
         H("AI Model")
         self._add_model_spinner(s, "Main Model", "ollama_model",
                                 profile.get("ollama_model", "llama3.1:8b"), font=font)
+        self._add_model_spinner(s, "Classifier Model", "intent_classifier_model",
+                                profile.get("intent_classifier_model", "qwen2.5:3b"), font=font)
 
         # ── Voice ──
         H("Voice")
         self._add_voice_spinner(s, "TTS Voice", "tts_voice",
                                 profile.get("tts_voice", ""), font=font)
+        self._add_slider(s, "Speech Rate", "tts_speed",
+                         0.5, 2.0, 0.1, profile.get("tts_speed", 1.0), "x", font=font)
         self._add_text_setting(s, "PTT Key", "push_to_talk_key",
                                profile.get("push_to_talk_key", "space"), font=font)
         self._add_slider(s, "Silence Duration", "silence_duration",
@@ -1087,6 +1091,8 @@ class SettingsScreen(FloatLayout):
         # Reload the assistant's conversation history for the new profile
         if hasattr(self._app, '_assistant') and self._app._assistant:
             assistant = self._app._assistant
+            from zeina.tts import TTSEngine
+            assistant.tts_engine = TTSEngine(voice=config.TTS_VOICE)
             assistant.conversation_history = []
             assistant.refresh_system_prompt(reason=f"profile switch → {name}")
             recent = self._settings.load_recent_messages(

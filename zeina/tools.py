@@ -515,21 +515,21 @@ def get_system_health() -> dict:
         try:
             uname_result = subprocess.run(["uname", "-a"], capture_output=True, text=True, timeout=5)
             system_info = uname_result.stdout.strip() if uname_result.returncode == 0 else platform.platform()
-        except:
+        except Exception:
             system_info = platform.platform()
-        
+
         # Current working directory
         try:
             pwd_result = subprocess.run(["pwd"], capture_output=True, text=True, timeout=5)
             current_directory = pwd_result.stdout.strip() if pwd_result.returncode == 0 else os.getcwd()
-        except:
+        except Exception:
             current_directory = os.getcwd()
-        
+
         # System uptime (if available)
         try:
             uptime_result = subprocess.run(["uptime"], capture_output=True, text=True, timeout=5)
             uptime_info = uptime_result.stdout.strip() if uptime_result.returncode == 0 else None
-        except:
+        except Exception:
             uptime_info = None
         
         # Network connectivity (basic check)

@@ -96,9 +96,8 @@ class AudioRecorder:
                 if self.speech_detected and self.silent_chunks_count > self.silent_chunks_threshold:
                     if self.stop_callback:
                         self.stop_callback(reason="silence")
-
-                # Time-based fallback for silence detection
-                if self.speech_detected and self.last_voice_time:
+                # Time-based fallback: only fires if chunk-count check didn't
+                elif self.speech_detected and self.last_voice_time:
                     if (time.time() - self.last_voice_time) > config.SILENCE_DURATION:
                         if self.stop_callback:
                             self.stop_callback(reason="silence")
