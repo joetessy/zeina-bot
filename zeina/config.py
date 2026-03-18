@@ -22,7 +22,7 @@ ACTIVE_PROFILE = "default"  # Kept in sync by Settings.apply_to_config()
 
 # AI Models
 OLLAMA_MODEL = "llama3.1:8b"  # The main language model for conversation
-INTENT_CLASSIFIER_MODEL = "qwen2.5:3b"  # Small fast model for tool intent classification
+INTENT_CLASSIFIER_MODEL = "qwen2.5:7b"  # Tool-calling model for intent classification + arg extraction
 VISION_MODEL = "moondream"              # Vision-capable model for screen queries
 
 # System Prompt - Customize Zeina's personality

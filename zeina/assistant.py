@@ -13,6 +13,7 @@ import os
 import time
 import json
 import re
+import difflib
 import queue as _queue
 from typing import Optional
 from datetime import datetime
@@ -97,10 +98,6 @@ class ZeinaAssistant:
         # Multi-turn follow-up tracking
         self._last_turn_had_tool_call = False
         self._last_tools_used: list[str] = []
-
-        # Cache for control_self args extracted during classification so
-        # _plan_tool_calls doesn't repeat the work.
-        self._pending_control_self_args: list[dict] | None = None
 
         # Track the most recent memory extraction thread so shutdown can join it
         self._memory_thread = None  # type: threading.Thread
@@ -780,306 +777,144 @@ class ZeinaAssistant:
         transcription = result['text'].strip()
         return transcription if transcription else None
 
-    def _check_control_self(self, message: str) -> bool:
-        """Stage-1 binary classifier: is the user asking Zeina to change herself?
+    def _classify_and_extract(self, message: str) -> list[tuple[str, dict]]:
+        """Classify tools AND extract arguments in a single pass.
 
-        Runs a short dedicated LLM call before the main classifier so that
-        control_self never has to compete with execute_shell and similar tools
-        in the same prompt.
+        Two-stage approach:
+          Stage 0 — Python patterns: _extract_ui_actions_multi deterministically
+                    collects all control_self actions (zero LLM cost).
+          Stage 1 — Native tool calling: a single ollama.chat(tools=...) call
+                    that returns both tool names AND structured arguments.
+                    Replaces the old Stage 1 (binary LLM), Stage 1.5 (fast-paths),
+                    Stage 2 (text classifier), and all _extract_* methods.
 
-        Fast-path: a few terms are unambiguously Zeina-internal and don't need
-        LLM inference — skip straight to YES.
+        Returns an ordered list of (tool_name, args_dict) pairs, or [] for no tools.
         """
-        m = message.lower()
-        # Fast-path: "setting"/"diagnostic"/"dashboard" almost always means
-        # Zeina's own screens — unless the user qualifies it with an external
-        # context (system settings, VS Code settings, etc.).
-        _zeina_screens = ("setting", "diagnostic", "dashboard")
-        _external = ("system", "computer", "mac", "windows", "phone", "iphone",
-                     "browser", "chrome", "firefox", "safari", "brave", "vscode",
-                     "vs code", "terminal", "finder", "iterm")
-        if any(t in m for t in _zeina_screens) and not any(e in m for e in _external):
-            return True
-
-        response = ollama.chat(
-            model=self._classifier_model,
-            messages=[{
-                "role": "user",
-                "content": (
-                    f"You are classifying messages for Zeina, an AI assistant app.\n"
-                    f"Zeina has built-in screens: a SETTINGS page and a DIAGNOSTICS dashboard.\n\n"
-                    f"Answer YES if the message is a direct command to control Zeina's own interface.\n"
-                    f"Answer NO for everything else.\n\n"
-                    f"Examples:\n"
-                    f"\"switch to midnight theme\" → YES\n"
-                    f"\"change the theme to terminal\" → YES\n"
-                    f"\"use ascii animation\" → YES\n"
-                    f"\"hide the status bar\" → YES\n"
-                    f"\"mute yourself\" → YES\n"
-                    f"\"unmute your voice\" → YES\n"
-                    f"\"clear the conversation history\" → YES\n"
-                    f"\"clear your memories\" → YES\n"
-                    f"\"change your name to Aria\" → YES\n"
-                    f"\"switch to voice mode\" → YES\n"
-                    f"\"switch to chat mode\" → YES\n"
-                    f"\"open settings\" → YES\n"
-                    f"\"open the settings page\" → YES\n"
-                    f"\"show settings\" → YES\n"
-                    f"\"pull up your settings\" → YES\n"
-                    f"\"pull up your settings page\" → YES\n"
-                    f"\"open your settings\" → YES\n"
-                    f"\"open zeina's settings\" → YES\n"
-                    f"\"open zeina's settings page\" → YES\n"
-                    f"\"bring up the settings\" → YES\n"
-                    f"\"open diagnostics\" → YES\n"
-                    f"\"open the diagnostics dashboard\" → YES\n"
-                    f"\"show me the diagnostics\" → YES\n"
-                    f"\"pull up the diagnostics\" → YES\n"
-                    f"\"open zeina's diagnostics\" → YES\n"
-                    f"\"switch to work profile\" → YES\n"
-                    f"\"switch profile to default\" → YES\n"
-                    f"\"switch ur face style\" → YES\n"
-                    f"\"change your face\" → YES\n"
-                    f"\"hide the menu button\" → YES\n"
-                    f"\"hide the three dot menu\" → YES\n"
-                    f"\"show the dots menu button\" → YES\n"
-                    f"\"open Safari\" → NO\n"
-                    f"\"open brave's settings\" → NO\n"
-                    f"\"open theverge.com\" → NO\n"
-                    f"\"open Terminal\" → NO\n"
-                    f"\"open my documents folder\" → NO\n"
-                    f"\"what's the weather\" → NO\n"
-                    f"\"search for flights\" → NO\n"
-                    f"\"hi\" → NO\n"
-                    f"\"thanks\" → NO\n"
-                    f"\"what time is it\" → NO\n\n"
-                    f"Message: \"{message}\"\n\nAnswer YES or NO:"
-                )
-            }],
-            options={"temperature": 0}
-        )
-        result = response['message'].get('content', 'no').strip().upper()
-        return result.startswith('Y')
-
-    def _classify_tool_intent(self, message: str) -> list[str]:
-        """Classify which tools are needed. Returns an ordered list of tool names
-        (possibly empty = no tools; repeats allowed for multi-action tools).
-
-        Three-stage approach:
-          Stage 0 — Python extraction: _extract_ui_actions_multi collects ALL
-                    control_self actions deterministically. Result is cached in
-                    _pending_control_self_args so _plan_tool_calls reuses it.
-          Stage 1 — LLM binary check for control_self: only runs if Stage 0
-                    found nothing; catches natural-language phrasings Python misses.
-          Stage 2 — multi-tool LLM classifier for all other tools (always runs).
-                    Returns a comma-separated list so multiple tools can fire.
-        """
-        tools_needed: list[str] = []
+        planned: list[tuple[str, dict]] = []
 
         # Stage 0: Python-first — collect all control_self actions.
         if 'control_self' in tool_manager.tools:
             ui_actions = self._extract_ui_actions_multi(message)
             if ui_actions:
-                self._pending_control_self_args = ui_actions
-                # One slot per action so _plan_tool_calls can pop them in order.
-                tools_needed.extend(['control_self'] * len(ui_actions))
-                self._obs("lite", f"Intent: control_self ×{len(ui_actions)}")
+                for action in ui_actions:
+                    planned.append(('control_self', action))
+                self._obs("lite", f"Intent: control_self ×{len(ui_actions)} (patterns)")
 
-        # Stage 1: LLM binary check — only when Python patterns found nothing.
-        if not tools_needed and 'control_self' in tool_manager.tools:
-            if self._check_control_self(message):
-                self._pending_control_self_args = [{}]  # args extracted later
-                tools_needed.append('control_self')
-                self._obs("lite", "Intent: control_self")
+        # Stage 1: Native tool calling for everything else.
+        control_self_handled = any(name == 'control_self' for name, _ in planned)
+        tool_schemas = self._get_tool_schemas(exclude_control_self=control_self_handled)
 
-        # Stage 1.5: Python fast-path for take_screenshot — common phrasings that
-        # the small classifier LLM (3b) often misroutes to "none".
-        if 'take_screenshot' in tool_manager.tools and 'take_screenshot' not in tools_needed:
-            _m = message.lower()
-            _screenshot_triggers = (
-                "what do you see", "what can you see", "what's on my screen",
-                "what is on my screen", "look at my screen", "look at the screen",
-                "whats on my screen", "can you see my screen",
+        if not tool_schemas:
+            return planned
+
+        # Build messages with conversation context for reference resolution
+        system_prompt = self._build_classifier_system_prompt(
+            control_self_handled=control_self_handled
+        )
+        messages: list[dict] = [{"role": "system", "content": system_prompt}]
+        # Include recent conversation turns so the model can resolve
+        # vague references ("that", "it", "the song") without a separate LLM call.
+        recent = [m for m in self.conversation_history
+                  if m.get("role") in ("user", "assistant")][-4:]
+        messages.extend(recent)
+        messages.append({"role": "user", "content": message})
+
+        try:
+            response = ollama.chat(
+                model=self._classifier_model,
+                messages=messages,
+                tools=tool_schemas,
+                options={"temperature": 0},
             )
-            if any(t in _m for t in _screenshot_triggers):
-                tools_needed.append('take_screenshot')
-                self._obs("lite", "Intent: take_screenshot (fast-path)")
+        except Exception as e:
+            self._obs("lite", f"Tool calling error: {e}")
+            return planned
 
-        # Stage 1.5b: Python fast-path for get_system_health — hardware/metric terms
-        # that the small classifier LLM (3b) often fails to map to the tool.
-        if 'get_system_health' in tool_manager.tools and 'get_system_health' not in tools_needed:
-            _m = message.lower()
-            _health_triggers = (
-                # Storage
-                "storage space", "disk space", "hard drive", "hard disk", "ssd",
-                "how much space", "free space", "space left", "space remaining",
-                "storage left", "storage remaining",
-                # Battery
-                "battery level", "battery life", "battery percentage", "battery status",
-                "how much battery",
-                # CPU / RAM
-                "cpu usage", "cpu load", "ram usage", "memory usage",
-                # General
-                "system health", "computer health",
-            )
-            if any(t in _m for t in _health_triggers):
-                tools_needed.append('get_system_health')
-                self._obs("lite", "Intent: get_system_health (fast-path)")
+        tool_calls = response.get('message', {}).get('tool_calls', [])
 
-        # Stage 2: multi-tool classifier — all tools except control_self.
-        other_tool_names = [t for t in tool_manager.tools.keys() if t != 'control_self']
-        tool_list = ", ".join(other_tool_names)
+        if not tool_calls:
+            self._obs("lite", f"Intent [{self._classifier_model}]: none")
+            return planned
 
-        prior_context = ""
+        seen_screenshot = any(name == 'take_screenshot' for name, _ in planned)
+        for tc in tool_calls:
+            fn = tc.get('function', {})
+            name = fn.get('name', '')
+            args = fn.get('arguments', {})
+
+            # Validate tool exists
+            if name not in tool_manager.tools:
+                self._obs("verbose", f"Unknown tool from native call: {name}")
+                continue
+
+            # Deduplicate take_screenshot
+            if name == 'take_screenshot' and seen_screenshot:
+                continue
+            if name == 'take_screenshot':
+                seen_screenshot = True
+
+            # Post-process remember: check for duplicate memories
+            if name == 'remember':
+                fact = args.get('fact', '')
+                if self._is_duplicate_memory(fact):
+                    self._obs("lite", "Memory: duplicate fact, skipping")
+                    continue
+
+            planned.append((name, args))
+            self._obs("lite", f"Intent [{self._classifier_model}]: {name}")
+
+        return planned
+
+    def _get_tool_schemas(self, exclude_control_self: bool = False) -> list[dict]:
+        """Return Ollama tool schemas, optionally excluding control_self."""
+        schemas = []
+        for name, tool in tool_manager.tools.items():
+            if name == 'control_self' and exclude_control_self:
+                continue
+            schemas.append(tool.to_ollama_schema())
+        return schemas
+
+    def _build_classifier_system_prompt(self, control_self_handled: bool = False) -> str:
+        """Build the system prompt for the native tool calling classifier."""
+        parts = [
+            "You are a tool router for Zeina, an AI voice assistant. "
+            "Call the appropriate tool(s) if the user's request matches one. "
+            "If no tool is needed (greetings, general knowledge, casual chat, "
+            "follow-ups on already-fetched data, hypothetical questions, "
+            "meta-questions about capabilities), respond with a short text message "
+            "instead of calling any tool. When in doubt, do NOT call a tool."
+        ]
+
+        # Prior-tool context to avoid re-triggering
         if self._last_turn_had_tool_call and self._last_tools_used:
             tools_str = ", ".join(f"'{t}'" for t in self._last_tools_used)
-            prior_context = (
-                f"CONTEXT: The previous turn already retrieved data using {tools_str} "
-                f"and that data is already in the conversation history. "
-                f"Only pick tools if the user is clearly asking for NEW or DIFFERENT information "
-                f"not covered by the existing data. If this looks like a follow-up question "
-                f"about the same topic, pick 'none'.\n\n"
+            parts.append(
+                f"\nCONTEXT: The previous turn already used {tools_str} and that data "
+                f"is in the conversation. Only call tools for NEW or DIFFERENT information."
             )
 
-        # If control_self actions were already found, bias Stage 2 toward none
-        # unless the message explicitly requests something else on top.
-        cs_context = ""
-        if tools_needed:
-            _cs_actions = [a.get('action', '') for a in (self._pending_control_self_args or []) if a.get('action')]
-            _action_str = (f" ({', '.join(_cs_actions)})" if _cs_actions else "")
-            cs_context = (
-                f"NOTE: The message has already been matched to Zeina's own interface "
-                f"controls{_action_str} and will be handled internally — no shell commands "
-                f"or external tools are needed for that part. "
-                f"Only add tools here if the message ALSO explicitly requests something "
-                f"external (open a specific non-Zeina app, search the web, get the time, etc.). "
-                f"If the entire message is about Zeina's own interface, reply 'none'.\n\n"
+        # Bias away from tools if control_self already handled
+        if control_self_handled:
+            parts.append(
+                "\nNOTE: This message was already matched to Zeina's internal UI controls. "
+                "Only call additional tools if the message ALSO explicitly requests "
+                "something external (open an app, search the web, etc.)."
             )
 
-        response = ollama.chat(
-            model=self._classifier_model,
-            messages=[{
-                "role": "user",
-                "content": (
-                    f"{prior_context}{cs_context}"
-                    f"You are a router. Given the user message, list ALL tools needed "
-                    f"as a comma-separated list, or 'none'. Available tools: {tool_list}\n\n"
-                    f"If the user wants multiple things that need the same tool, repeat it "
-                    f"(e.g. 'execute_shell, execute_shell' for two apps to open).\n\n"
-                    f"Rules:\n"
-                    f"- web_search: User asks to search/look something up online, or needs "
-                    f"real-time data (live news, scores, prices, current events). "
-                    f"NOT for greetings, opinions, or follow-up questions on known data. "
-                    f"NEVER for weather (use get_weather).\n"
-                    f"- get_weather: User asks about outdoor weather, temperature, or forecast "
-                    f"for a city/location. NOT for computer temperature.\n"
-                    f"- get_current_time: User asks for the current time or date.\n"
-                    f"- calculate: User wants the answer to a math expression or calculation.\n"
-                    f"- get_location: User asks where they are geographically "
-                    f"('what city am I in', 'where am I'). NOT for file/directory location.\n"
-                    f"- get_system_health: User asks about the state of their computer hardware "
-                    f"or system metrics. Use for ANY question about: disk/storage space or "
-                    f"fullness ('how full is my drive', 'how much space', 'my SSD', "
-                    f"'running out of space', 'storage left'), battery ('battery level', "
-                    f"'how much battery', 'is it charging'), CPU or RAM ('how fast', "
-                    f"'memory usage', 'cpu load'), network, OS, uptime, or general machine "
-                    f"health ('how's my computer', 'is my computer slow'). "
-                    f"Use whenever the question is about the user's own machine state.\n"
-                    f"- read_file: User wants to read the contents of a specific file.\n"
-                    f"- list_directory: User wants a list of files inside a folder.\n"
-                    f"- remember: User explicitly asks to save/remember a fact about themselves "
-                    f"('remember that', 'don't forget', 'keep in mind').\n"
-                    f"- execute_shell: ONLY when the user gives a DIRECT, IMPERATIVE command to "
-                    f"perform an OS action RIGHT NOW. The message must be a command, not a "
-                    f"question, not hypothetical, not meta-discussion about capabilities. "
-                    f"Trigger: imperative verb ('open', 'launch', 'run', 'start', 'kill', "
-                    f"'close') + specific target app/URL/command. "
-                    f"NOT for: 'I wonder if...', 'should I...', 'can you...', 'what if...', "
-                    f"'give you the ability to...', discussions about what Zeina could do. "
-                    f"NOT for system metrics queries (battery, disk, CPU, RAM, storage) — "
-                    f"use get_system_health for those instead.\n"
-                    f"- read_clipboard: User wants to read what is currently in the clipboard.\n"
-                    f"- write_clipboard: User wants to copy specific text to the clipboard.\n"
-                    f"- take_screenshot: User asks about something on their screen, wants you to "
-                    f"look at / read / describe screen content "
-                    f"('what do you see', 'look at this', 'what's on my screen'). "
-                    f"NEVER repeat take_screenshot — one screenshot per request.\n"
-                    f"- none: Everything else. Use this for: greetings, casual chat, general "
-                    f"knowledge questions, hypothetical/capability discussions ('I wonder if', "
-                    f"'should I', 'can you', 'what if', 'what tools do you have'), "
-                    f"meta-questions about what Zeina can do, follow-up on already-fetched data. "
-                    f"When in doubt, pick none.\n\n"
-                    f"User message: \"{message}\"\n\n"
-                    f"Reply with ONLY a comma-separated list of tool names, or \"none\". "
-                    f"Examples: \"execute_shell\" | \"execute_shell, execute_shell\" | \"web_search\" | \"none\""
-                )
-            }],
-            options={"temperature": 0}
-        )
-        raw = response['message'].get('content', 'none').strip().lower()
-        # Parse comma-separated list, cleaning each token
-        stage2_tools = []
-        for token in raw.split(','):
-            t = token.strip().replace('.', '').replace('"', '').replace("'", '')
-            if t and t != 'none' and t in other_tool_names:
-                stage2_tools.append(t)
-        # take_screenshot should never be duplicated (fast-path may have already added it)
-        stage2_tools = [t for t in stage2_tools
-                        if t != 'take_screenshot' or 'take_screenshot' not in tools_needed]
-        if stage2_tools:
-            self._obs("lite", f"Intent [{self._classifier_model}]: {', '.join(stage2_tools)}")
-        else:
-            self._obs("lite", f"Intent [{self._classifier_model}]: none")
-        tools_needed.extend(stage2_tools)
-        return tools_needed
+        return "\n".join(parts)
 
-    def _resolve_references(self, message: str) -> str:
-        """Rewrite vague references ('that', 'it', 'the song', etc.) into
-        concrete text using recent conversation history.  Returns the original
-        message unchanged if there is nothing to resolve or no history."""
-        # Quick check: only run if the message contains a likely vague reference
-        _VAGUE = ("that", "it", "this", "those", "them", "the one", "the song",
-                  "the file", "the app", "the thing", "what you said",
-                  "what you mentioned", "the last one", "the previous")
-        lower = message.lower()
-        if not any(v in lower for v in _VAGUE):
-            return message
-
-        history = self.conversation_history
-        if not history:
-            return message
-
-        recent = [m for m in history if m.get("role") in ("user", "assistant")][-6:]
-        if not recent:
-            return message
-
-        lines = []
-        for m in recent:
-            role = "User" if m["role"] == "user" else "Assistant"
-            lines.append(f"{role}: {m['content']}")
-        context = "\n".join(lines)
-
-        response = ollama.chat(
-            model=self._classifier_model,
-            messages=[{
-                "role": "user",
-                "content": (
-                    f"Recent conversation:\n{context}\n\n"
-                    f"Rewrite the following message so that any vague references "
-                    f"('that', 'it', 'the song', 'the file', 'the one', 'what you said', etc.) "
-                    f"are replaced with the specific thing they refer to based on the conversation above.\n"
-                    f"If the message is already explicit, return it unchanged.\n"
-                    f"Return ONLY the rewritten message, nothing else.\n\n"
-                    f"Message: \"{message}\""
-                )
-            }],
-            options={"temperature": 0}
-        )
-        resolved = response['message'].get('content', '').strip().strip('"')
-        if resolved:
-            self._obs("verbose", f"Reference resolved: '{message}' → '{resolved}'")
-            return resolved
-        return message
+    def _is_duplicate_memory(self, fact: str) -> bool:
+        """Check if a fact is already stored using string similarity."""
+        if not fact or not self.settings:
+            return False
+        existing = self.settings.load_memories(config.ACTIVE_PROFILE)
+        if not existing:
+            return False
+        fact_lower = fact.lower().strip()
+        for mem in existing:
+            if difflib.SequenceMatcher(None, fact_lower, mem.lower()).ratio() > 0.8:
+                return True
+        return False
 
     def _match_ui_patterns(self, m: str, message: str, multi: bool) -> list[dict]:
         """Shared pattern matching core for UI control actions.
@@ -1233,245 +1068,6 @@ class ZeinaAssistant:
             options={"temperature": 0}
         )
         return response['message'].get('content', '').strip()
-
-    def _extract_clipboard_content(self, message: str) -> str:
-        """Use the classifier LLM to extract what the user wants written to the clipboard.
-        Vague references are already resolved by _resolve_references before this is called."""
-        response = ollama.chat(
-            model=self._classifier_model,
-            messages=[{
-                "role": "user",
-                "content": (
-                    f"Extract exactly what the user wants copied to their clipboard.\n"
-                    f"Return ONLY the text to copy, with no explanation or extra words.\n"
-                    f"Examples:\n"
-                    f"  'copy hello world to my clipboard' → hello world\n"
-                    f"  'put my email address in the clipboard: test@example.com' → test@example.com\n"
-                    f"  'add Bohemian Rhapsody to my clipboard' → Bohemian Rhapsody\n\n"
-                    f"User message: \"{message}\""
-                )
-            }],
-            options={"temperature": 0}
-        )
-        content = response['message'].get('content', '').strip()
-        self._obs("verbose", f"Clipboard content: {content}")
-        return content if content else message
-
-    def _extract_shell_command(self, message: str) -> str:
-        """Use the classifier LLM to extract a shell command from a natural language request.
-        Vague references are already resolved by _resolve_references before this is called."""
-        response = ollama.chat(
-            model=self._classifier_model,
-            messages=[{
-                "role": "user",
-                "content": (
-                    f"Extract the shell command the user wants to run from this message. "
-                    f"Reply with ONLY the shell command, nothing else. "
-                    f"Use macOS/Linux syntax. For opening apps use 'open -a \"AppName\"'. "
-                    f"For opening a URL in a specific browser: open -a \"BrowserName\" \"https://url\"\n"
-                    f"For opening a URL in the default browser: open \"https://url\"\n"
-                    f"Default browser is Brave unless the user specifies Safari or another browser.\n"
-                    f"Always add https:// to bare domains (e.g. theverge.com → https://theverge.com).\n"
-                    f"Always quote the app name with double quotes.\n"
-                    f"For YouTube searches: open -a \"Brave Browser\" \"https://www.youtube.com/results?search_query=<query+with+plus+for+spaces>\"\n"
-                    f"For DuckDuckGo searches: open -a \"Brave Browser\" \"https://duckduckgo.com/?q=<query+with+plus+for+spaces>\"\n"
-                    f"If the request is ambiguous, produce the most likely shell command.\n\n"
-                    f"Examples:\n"
-                    f"  'open theverge.com' → open -a \"Brave Browser\" \"https://theverge.com\"\n"
-                    f"  'open gmail in safari' → open -a \"Safari\" \"https://gmail.com\"\n"
-                    f"  'open gmail in brave' → open -a \"Brave Browser\" \"https://gmail.com\"\n"
-                    f"  'search youtube for lo-fi music' → open -a \"Brave Browser\" \"https://www.youtube.com/results?search_query=lo-fi+music\"\n"
-                    f"  'open youtube' → open -a \"Brave Browser\" \"https://www.youtube.com\"\n"
-                    f"  'open Ichibanboshi Mitsuketa on youtube' → open -a \"Brave Browser\" \"https://www.youtube.com/results?search_query=Ichibanboshi+Mitsuketa\"\n"
-                    f"  'launch calculator' → open -a \"Calculator\"\n\n"
-                    f"Message: \"{message}\""
-                )
-            }],
-            options={"temperature": 0}
-        )
-        command = response['message'].get('content', '').strip()
-        self._obs("verbose", f"Shell command: {command}")
-        return command
-
-    def _extract_shell_commands_multi(self, message: str) -> list[str]:
-        """Extract all shell commands from a multi-action request.
-
-        Returns a list of command strings. Falls back to a single command if
-        the LLM doesn't return valid JSON.
-        """
-        response = ollama.chat(
-            model=self._classifier_model,
-            messages=[{
-                "role": "user",
-                "content": (
-                    f"Extract ALL shell commands the user wants to run from this message. "
-                    f"Return a JSON array of shell command strings, nothing else.\n"
-                    f"Use macOS/Linux syntax. For opening apps use 'open -a \"AppName\"'.\n"
-                    f"For opening a URL in a specific browser: open -a \"BrowserName\" \"https://url\"\n"
-                    f"Default browser is Brave unless the user specifies another browser.\n"
-                    f"Always add https:// to bare domains.\n"
-                    f"Always quote app names with double quotes.\n"
-                    f"For YouTube searches: open -a \"Brave Browser\" \"https://www.youtube.com/results?search_query=<query+with+plus>\"\n\n"
-                    f"Examples:\n"
-                    f"  'open safari and calculator' → [\"open -a \\\"Safari\\\"\", \"open -a \\\"Calculator\\\"\"]\n"
-                    f"  'open youtube and spotify' → [\"open -a \\\"Brave Browser\\\" \\\"https://youtube.com\\\"\", \"open -a \\\"Spotify\\\"\"]\n"
-                    f"  'launch finder' → [\"open -a \\\"Finder\\\"\"]\n\n"
-                    f"Message: \"{message}\"\n\n"
-                    f"Return ONLY a JSON array of strings:"
-                )
-            }],
-            options={"temperature": 0}
-        )
-        raw = response['message'].get('content', '').strip()
-        try:
-            commands = json.loads(raw)
-            if isinstance(commands, list) and commands:
-                result = [str(c) for c in commands if c]
-                self._obs("verbose", f"Shell commands: {result}")
-                return result
-        except (json.JSONDecodeError, ValueError):
-            pass
-        # Fallback to single-command extractor
-        return [self._extract_shell_command(message)]
-
-    def _plan_tool_calls(self, tools: list[str], message: str) -> list[tuple[str, dict]]:
-        """Build an ordered list of (tool_name, args) pairs for all planned tools.
-
-        Handles multi-instance tools (execute_shell, control_self) by extracting
-        all their args in bulk, then distributing them across the slots.
-        """
-        msg = self._resolve_references(message)
-        planned: list[tuple[str, dict]] = []
-
-        # Pre-extract bulk args for multi-instance tools.
-        cs_actions: list[dict] = list(self._pending_control_self_args or [])
-        self._pending_control_self_args = None
-        cs_idx = 0
-
-        shell_tools_count = tools.count('execute_shell')
-        shell_commands: list[str] = []
-        if shell_tools_count > 1:
-            shell_commands = self._extract_shell_commands_multi(msg)
-        elif shell_tools_count == 1:
-            shell_commands = [self._extract_shell_command(msg)]
-        shell_idx = 0
-
-        for tool_name in tools:
-            if tool_name == 'control_self':
-                if cs_idx < len(cs_actions) and cs_actions[cs_idx].get("action"):
-                    planned.append(('control_self', cs_actions[cs_idx]))
-                else:
-                    planned.append(('control_self', self._extract_ui_action(msg)))
-                cs_idx += 1
-            elif tool_name == 'execute_shell':
-                if shell_idx < len(shell_commands):
-                    planned.append(('execute_shell', {'command': shell_commands[shell_idx]}))
-                else:
-                    planned.append(('execute_shell', {'command': self._extract_shell_command(msg)}))
-                shell_idx += 1
-            elif tool_name == 'web_search':
-                planned.append((tool_name, {'query': msg}))
-            elif tool_name == 'get_current_time':
-                planned.append((tool_name, {}))
-            elif tool_name == 'calculate':
-                planned.append((tool_name, {'expression': msg}))
-            elif tool_name == 'get_weather':
-                planned.append((tool_name, {'location': self._extract_location(msg)}))
-            elif tool_name == 'get_location':
-                planned.append((tool_name, {}))
-            elif tool_name == 'read_file':
-                planned.append((tool_name, {'path': self._extract_path(msg)}))
-            elif tool_name == 'list_directory':
-                planned.append((tool_name, {'path': self._extract_path(msg)}))
-            elif tool_name == 'get_system_health':
-                planned.append((tool_name, {}))
-            elif tool_name == 'remember':
-                planned.append((tool_name, {'fact': self._extract_fact(msg)}))
-            elif tool_name == 'read_clipboard':
-                planned.append((tool_name, {}))
-            elif tool_name == 'write_clipboard':
-                planned.append((tool_name, {'content': self._extract_clipboard_content(msg)}))
-            elif tool_name == 'take_screenshot':
-                planned.append((tool_name, {}))
-            else:
-                planned.append((tool_name, {}))
-        return planned
-
-    def _extract_fact(self, message: str) -> str:
-        """Extract the fact the user wants remembered from their message."""
-        # Build existing-memory context so the LLM can normalise consistently
-        existing_block = ""
-        if self.settings:
-            existing = self.settings.load_memories(config.ACTIVE_PROFILE)
-            if existing:
-                existing_block = (
-                    "Already known facts (do NOT return any of these):\n"
-                    + "\n".join(f"- {f}" for f in existing)
-                    + "\n\n"
-                )
-
-        response = ollama.chat(
-            model=self._classifier_model,
-            messages=[{
-                "role": "user",
-                "content": (
-                    f"Extract the specific fact the user wants to be remembered from this message. "
-                    f"Rephrase it as a short, clear statement starting with a verb or noun — "
-                    f"NO subject pronoun (not 'she', 'he', 'they', 'the user', 'I'). "
-                    f"Examples: 'prefers dark mode', 'has a dog named Max'. "
-                    f"If the fact is already listed below as already known, reply with exactly: ALREADY_KNOWN\n"
-                    f"Reply with ONLY the fact (or ALREADY_KNOWN), nothing else.\n\n"
-                    f"{existing_block}"
-                    f"Message: \"{message}\""
-                )
-            }],
-            options={"temperature": 0}
-        )
-        fact = response['message'].get('content', message).strip()
-        if fact.upper() == "ALREADY_KNOWN":
-            self._obs("lite", "Memory extraction: fact already known, skipping")
-            return ""
-        self._obs("verbose", f"Extracted fact: {fact}")
-        return fact if fact else message
-
-    def _extract_path(self, message: str) -> str:
-        """Use the classifier LLM to extract a file or directory path from a natural language request."""
-        response = ollama.chat(
-            model=self._classifier_model,
-            messages=[{
-                "role": "user",
-                "content": (
-                    f"Extract the file or directory path from this message. "
-                    f"Use standard macOS/Linux path conventions (e.g. '~/Documents', '~/.zshrc'). "
-                    f"Reply with ONLY the path, nothing else. "
-                    f"If no specific file or folder is mentioned, reply with '~'.\n\n"
-                    f"Message: \"{message}\""
-                )
-            }],
-            options={"temperature": 0}
-        )
-        path = response['message'].get('content', '~').strip() or '~'
-        self._obs("verbose", f"Path: {path}")
-        return path
-
-    def _extract_location(self, message: str) -> str:
-        """Extract a location name from a user message for weather queries.
-        Uses a fast LLM call to reliably pull out the city/location."""
-        response = ollama.chat(
-            model=self._classifier_model,
-            messages=[{
-                "role": "user",
-                "content": (
-                    f"Extract the city or location name from this message. "
-                    f"Reply with ONLY the location name, nothing else.\n\n"
-                    f"Message: \"{message}\""
-                )
-            }],
-            options={"temperature": 0}
-        )
-        location = response['message'].get('content', message).strip()
-        self._obs("verbose", f"Location: {location}")
-        return location if location else message
 
     def _maybe_summarize_history(self) -> None:
         """Summarize old conversation turns when history grows too long.
@@ -1639,18 +1235,17 @@ class ZeinaAssistant:
         # Summarize or trim conversation history if it exceeds max length
         self._maybe_summarize_history()
 
-        # Step 1: Classify which tools (if any) are needed.
-        tools_needed: list[str] = []
+        # Step 1+2: Classify tools AND extract args in one pass, then execute.
+        planned_calls: list[tuple[str, dict]] = []
         if tool_manager.has_tools():
-            tools_needed = self._classify_tool_intent(user_message)
+            planned_calls = self._classify_and_extract(user_message)
 
-        # Step 2: Execute all tools and collect results.
-        if tools_needed:
+        if planned_calls:
+            tools_needed = [name for name, _ in planned_calls]
             self.display.move_cursor_to_feed_bottom()
             label = ", ".join(dict.fromkeys(tools_needed))  # deduplicated for display
             self.display.show_info(f"Using tool: {label}")
 
-            planned_calls = self._plan_tool_calls(tools_needed, user_message)
             tool_results: list[tuple[str, str]] = []
 
             for tool_name, tool_args in planned_calls:
@@ -1669,7 +1264,7 @@ class ZeinaAssistant:
                 self._obs("verbose", f"Tool result:\n{tool_result}")
                 tool_results.append((tool_name, tool_result))
 
-            # Step 2b: Inject results into conversation history.
+            # Inject results into conversation history.
             self._inject_tool_results(tool_results, tools_needed, user_message)
 
             self._last_turn_had_tool_call = True

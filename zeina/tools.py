@@ -121,7 +121,10 @@ tool_manager = ToolManager()
         "properties": {
             "fact": {
                 "type": "string",
-                "description": "The fact to remember about the user, phrased as a short statement"
+                "description": (
+                    "The fact to remember, phrased as a short statement without a subject. "
+                    "Example: 'likes pizza' not 'The user likes pizza'."
+                )
             }
         },
         "required": ["fact"]
@@ -427,13 +430,17 @@ def _safe_path(raw: str):
 
 @tool_manager.register(
     name="read_file",
-    description="Read the contents of a file. Only works for files inside the home directory or project folder.",
+    description="Read the text contents of a file. Only works for files inside the home directory or project folder.",
     parameters={
         "type": "object",
         "properties": {
             "path": {
                 "type": "string",
-                "description": "Absolute or ~ path to the file to read"
+                "description": (
+                    "Absolute or ~ path to the file (e.g. '~/Documents/notes.txt', '~/.zshrc'). "
+                    "Use standard macOS/Linux path conventions. Expand common names: "
+                    "'my documents' → '~/Documents', 'desktop' → '~/Desktop'."
+                )
             }
         },
         "required": ["path"]
@@ -464,7 +471,11 @@ _MAX_DIR_ENTRIES = 100
         "properties": {
             "path": {
                 "type": "string",
-                "description": "Directory path to list (defaults to ~)"
+                "description": (
+                    "Directory path to list (defaults to ~). "
+                    "Use standard macOS/Linux paths. Expand common names: "
+                    "'my documents' → '~/Documents', 'downloads' → '~/Downloads'."
+                )
             }
         },
         "required": []
@@ -490,8 +501,13 @@ def list_directory(path: str = "~") -> str:
 
 @tool_manager.register(
     name="get_system_health",
-    description="Get a real-time report of the computer's health, including CPU, memory, disk, battery, working directory, and system information.",
-    parameters={"type": "object", "properties": {}}
+    description=(
+        "Get a real-time report of the computer's health and performance metrics. "
+        "Use for ANY question about: disk/storage space, battery level, CPU usage, "
+        "RAM/memory usage, network status, OS info, uptime, or general system health. "
+        "NOT for weather or temperature — use get_weather for those."
+    ),
+    parameters={"type": "object", "properties": {}, "required": []}
 )
 def get_system_health() -> dict:
     """Gathers high-level system metrics using psutil and system commands."""
@@ -638,15 +654,27 @@ _SHELL_BLOCKED = [
 @tool_manager.register(
     name="execute_shell",
     description=(
-        "Execute a shell command on the system. Use for opening apps, running scripts, "
-        "listing processes, or performing system tasks the user requests."
+        "Execute a shell command on the system. Use ONLY when the user gives a DIRECT, "
+        "IMPERATIVE command to perform an action RIGHT NOW — e.g. 'open Safari', "
+        "'launch Spotify', 'kill Terminal', 'close Finder'. "
+        "Requires an imperative verb (open/launch/run/start/kill/close) + specific target. "
+        "NOT for questions, hypotheticals, or system metrics (use get_system_health for those)."
     ),
     parameters={
         "type": "object",
         "properties": {
             "command": {
                 "type": "string",
-                "description": "The shell command to execute (e.g. 'open -a Calculator', 'ls -la ~')"
+                "description": (
+                    "The macOS/Linux shell command to execute. Rules: "
+                    "Open apps: open -a \"AppName\" (always double-quote app names). "
+                    "Open URLs: open -a \"Brave Browser\" \"https://url\". "
+                    "YouTube search: open -a \"Brave Browser\" \"https://www.youtube.com/results?search_query=query+words\". "
+                    "Web search: open -a \"Brave Browser\" \"https://duckduckgo.com/?q=query+words\". "
+                    "Default browser is Brave Browser unless user specifies another. "
+                    "Always include https:// for URLs. "
+                    "Close/kill: pkill -x \"AppName\" or killall \"AppName\"."
+                )
             }
         },
         "required": ["command"]
@@ -782,7 +810,11 @@ def write_clipboard(content: str) -> str:
 
 @tool_manager.register(
     name="take_screenshot",
-    description="Capture the current screen for visual analysis.",
+    description=(
+        "Capture the current screen for visual analysis. Use when the user asks about "
+        "what's on their screen, wants you to look at or read something on screen, "
+        "or says 'what do you see'. Only call once per request."
+    ),
     parameters={"type": "object", "properties": {}, "required": []},
 )
 def take_screenshot() -> str:
