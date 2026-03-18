@@ -630,8 +630,8 @@ class Settings:
         user_name = self.get("user_name", "").strip()
         if user_name:
             additions.append(
-                f"The user's name is {user_name}. This is definitive — always use {user_name} "
-                f"regardless of any other name that appears in the conversation history."
+                f"The user's name is {user_name}. You may use it occasionally in a natural way, "
+                f"but don't repeat it constantly — most replies don't need to include it."
             )
 
         resp_len = self.get("response_length", "concise")

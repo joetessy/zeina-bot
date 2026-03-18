@@ -129,11 +129,11 @@ Zeina uses two Ollama models. Pull both before running:
 # Main conversation model (~4.7 GB)
 ollama pull llama3.1:8b
 
-# Fast intent classifier (~2 GB)
-ollama pull llama3.2:3b
+# Fast intent classifier with native tool calling (~4.7 GB)
+ollama pull qwen2.5:7b
 ```
 
-You can change the main model from Settings > AI Model or via Ctrl+M. The intent classifier model is configured in `zeina/config.py`.
+You can change both models from Settings > AI Model. The main model is also switchable via Ctrl+M.
 
 ### Download a Piper TTS Voice
 
@@ -213,6 +213,7 @@ Zeina classifies intent automatically and calls the right tool when needed.
 | **execute_shell** | "Open Safari", "Run ls", "Launch VS Code" | Execute a shell command (requires verbal confirmation) |
 | **read_clipboard** | "What's in my clipboard?", "Read my clipboard" | Read the current clipboard text |
 | **write_clipboard** | "Copy X to clipboard", "Put that in my clipboard" | Write text to the clipboard |
+| **control_self** | "Switch to midnight theme", "Hide the status bar" | Control app UI, themes, modes, visibility |
 
 ### Weather Tool Setup
 
@@ -231,7 +232,7 @@ Most settings are managed through the in-app Settings screen (⚙ icon). For low
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `OLLAMA_MODEL` | `llama3.1:8b` | Main conversation model |
-| `INTENT_CLASSIFIER_MODEL` | `llama3.2:3b` | Fast tool-routing model |
+| `INTENT_CLASSIFIER_MODEL` | `qwen2.5:7b` | Tool-calling classifier (native tool calling) |
 | `WHISPER_MODEL` | `base` | ASR model size (`tiny`, `base`, `small`, `medium`, `large-v3`) |
 | `WHISPER_DEVICE` | `cpu` | Use `cuda` for GPU acceleration |
 | `TTS_VOICE` | `models/en_GB-southern_english_female-low.onnx` | Piper voice model path |

@@ -1248,8 +1248,28 @@ class ZeinaAssistant:
 
             tool_results: list[tuple[str, str]] = []
 
-            for tool_name, tool_args in planned_calls:
-                # Window hide/show around screenshot capture
+            # Partition into parallel (stateless) and sequential (UI-dependent) tools
+            _SEQUENTIAL_TOOLS = {"take_screenshot", "execute_shell", "control_self"}
+            parallel_calls = [(n, a) for n, a in planned_calls if n not in _SEQUENTIAL_TOOLS]
+            sequential_calls = [(n, a) for n, a in planned_calls if n in _SEQUENTIAL_TOOLS]
+
+            # Run parallelisable tools concurrently
+            if parallel_calls:
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+
+                def _exec(name, args):
+                    return (name, tool_manager.execute_tool(name, args))
+
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    futures = [pool.submit(_exec, n, a) for n, a in parallel_calls]
+                    for f in as_completed(futures):
+                        name, result = f.result()
+                        self._obs("lite", f"Tool: {name} → {len(result)} chars")
+                        self._obs("verbose", f"Tool result:\n{result}")
+                        tool_results.append((name, result))
+
+            # Run sequential tools in order (with UI guards)
+            for tool_name, tool_args in sequential_calls:
                 if tool_name == "take_screenshot" and hasattr(self.display, 'hide_window'):
                     self.display.hide_window()
 

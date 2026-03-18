@@ -444,6 +444,7 @@ class SettingsScreen(FloatLayout):
 
         inp.bind(on_text_validate=_on_change)
         inp.bind(focus=lambda inst, focused: _on_change(inst) if not focused else None)
+        inp.bind(text=lambda inst, val: _on_change(inst))
         row.add_widget(inp)
         parent.add_widget(row)
 

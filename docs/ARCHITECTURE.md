@@ -46,48 +46,37 @@
                           │ transcription (string)
                           ▼
               ┌────────────────────────┐
-              │  Intent Classification │
-              │  (llama3.2:3b - fast)  │
+              │  Classification +      │
+              │  Arg Extraction        │
+              │  (qwen2.5:7b)          │
               │                        │
-              │  "Which tool needed?"  │
-              │  → web_search          │
-              │  → get_weather         │
-              │  → calculate           │
-              │  → get_current_time    │
-              │  → get_location        │
-              │  → read_file           │
-              │  → list_directory      │
-              │  → get_system_health   │
-              │  → take_screenshot     │
-              │  → remember            │
-              │  → execute_shell       │
-              │  → read_clipboard      │
-              │  → write_clipboard     │
-              │  → none                │
+              │  Stage 0: Python       │
+              │  patterns for          │
+              │  control_self          │
+              │                        │
+              │  Stage 1: Native       │
+              │  tool calling          │
+              │  ollama.chat(tools=...)│
+              │  Returns structured    │
+              │  tool_calls + args     │
               └───────────┬────────────┘
                           │
                 ┌─────────┴─────────┐
                 │                   │
-          tool != none         tool == none
+          tools needed        no tools
                 │                   │
                 ▼                   │
    ┌────────────────────────┐       │
-   │   Arg Extraction       │       │
-   │   (llama3.2:3b)        │       │
-   │                        │       │
-   │  Second fast LLM call  │       │
-   │  extracts structured   │       │
-   │  args from user text   │       │
-   └───────────┬────────────┘       │
-               │                    │
-               ▼                    │
-   ┌────────────────────────┐       │
    │   Tool Execution       │       │
-   │   (tools.py)           │       │
+   │   (tools/ package)     │       │
    │                        │       │
-   │  Execute tool function │       │
-   │  Inject result as      │       │
-   │  [DATA] user message   │       │
+   │  Parallel: stateless   │       │
+   │  tools via ThreadPool  │       │
+   │  Sequential: UI tools  │       │
+   │  (screenshot, shell,   │       │
+   │   control_self)        │       │
+   │  Inject results as     │       │
+   │  [DATA] user messages  │       │
    └───────────┬────────────┘       │
                │                    │
                └────────┬───────────┘
@@ -132,8 +121,9 @@
                           │ text
                           ▼
               ┌────────────────────────┐
-              │  Intent Classification │
-              │  (same as voice mode)  │
+              │  Classification +      │
+              │  Arg Extraction        │
+              │  (native tool calling) │
               └───────────┬────────────┘
                           │
                     ┌─────┴─────┐
@@ -141,10 +131,8 @@
               tool needed    no tool
                     │           │
                     ▼           │
-           Arg Extraction       │
-                    │           │
-                    ▼           │
               Tool Execution    │
+              (parallel/seq)    │
                     │           │
                     └─────┬─────┘
                           │
@@ -204,30 +192,29 @@ Full-screen overlay with sections:
 
 Profile Save / Delete buttons are anchored at the bottom, independent of the scroll area.
 
-## Tool Integration (Three-Step Pattern)
+## Tool Integration (Two-Step Pattern)
 
-This design prevents the LLM from leaking tool reasoning into its spoken response.
+Classification and argument extraction happen in a single LLM call via Ollama native tool calling.
 
 ```
-Step 1: Classification          Step 2: Arg Extraction        Step 3: Execution + Response
-┌───────────────────────┐    ┌────────────────────────┐    ┌───────────────────────────────┐
-│                       │    │                        │    │                               │
-│  User message →       │    │  Same fast model (3b)  │    │  Tool result injected as a    │
-│  small fast model     │    │  extracts structured   │    │  [DATA] user message:         │
-│  (3b):                │    │  args from natural     │    │                               │
-│                       │    │  language:             │    │  "[DATA] Search results for   │
-│  "Which tool?         │    │                        │    │   'Paris weather' ..."        │
-│   web_search |        │    │  location="London"     │    │                               │
-│   get_weather |       │    │  query="latest news"   │    │  Main LLM (8b) then generates │
-│   calculate |         │    │  expression="2+2"      │    │  a natural conversational     │
-│   get_current_time |  │    │  path="~/notes.txt"    │    │  response — never sees tool   │
-│   get_location |      │    │                        │    │  schema directly              │
-│   read_file |         │    │                        │    │                               │
-│   list_directory |    │    │                        │    │                               │
-│   get_system_health | │    │                        │    │                               │
-│   none"               │    │                        │    │                               │
-│                       │    │                        │    │                               │
-└───────────────────────┘    └────────────────────────┘    └───────────────────────────────┘
+Step 1: Classify + Extract (single call)          Step 2: Execution + Response
+┌──────────────────────────────────────┐    ┌───────────────────────────────────┐
+│                                      │    │                                   │
+│  Stage 0: Python pattern matching    │    │  Parallel execution:              │
+│  for control_self (zero-cost,        │    │  - Stateless tools run via        │
+│  closed vocab: themes, modes, etc.)  │    │    ThreadPoolExecutor (max 4)     │
+│                                      │    │  - UI tools run sequentially      │
+│  Stage 1: ollama.chat(tools=...)     │    │    (screenshot, shell, control)   │
+│  using qwen2.5:7b with full tool     │    │                                   │
+│  JSON schemas. Returns structured    │    │  Results injected as [DATA] user  │
+│  tool_calls with arguments:          │    │  messages. Main LLM generates     │
+│                                      │    │  natural response — never sees    │
+│  [{name: "get_weather",              │    │  tool schema directly.            │
+│    arguments: {location: "London"}}, │    │                                   │
+│   {name: "get_current_time",         │    │                                   │
+│    arguments: {timezone: "UTC"}}]    │    │                                   │
+│                                      │    │                                   │
+└──────────────────────────────────────┘    └───────────────────────────────────┘
 ```
 
 ### Tool Reference
@@ -247,6 +234,7 @@ Step 1: Classification          Step 2: Arg Extraction        Step 3: Execution 
 | `execute_shell` | Run a shell command | Requires verbal confirmation first; Zeina speaks the command and waits for user voice approval |
 | `read_clipboard` | Read system clipboard text | No internet; macOS/Linux |
 | `write_clipboard` | Write text to system clipboard | No internet; macOS/Linux |
+| `control_self` | Control app UI: themes, modes, visibility, names | Stage 0 Python patterns only |
 
 ### Vision Pipeline (take_screenshot)
 
@@ -314,9 +302,9 @@ Vision model is configured per-profile: Settings > AI Model > Vision Model.
 │                      │  │                      │  │   interaction)  │
 │  FaceWidget ticks    │  │  Mic callback feeds  │  │                 │
 │  via Clock.schedule_ │  │  AudioRecorder       │  │  Transcribe →   │
-│  interval()          │  │  VAD analysis        │  │  Classify →     │
-│                      │  │                      │  │  Extract args → │
-│                      │  │                      │  │  [Tool] → LLM → │
+│  interval()          │  │  VAD analysis        │  │  Classify +     │
+│                      │  │                      │  │  extract args → │
+│                      │  │                      │  │  [Tools ∥] →    │
 │                      │  │                      │  │  TTS → Auto-    │
 │                      │  │                      │  │  listen         │
 └──────────────────────┘  └──────────────────────┘  └─────────────────┘
@@ -349,7 +337,7 @@ Thread Safety:
           │       ┌────────────┐              │
           └───────│ PROCESSING │──────────────┘
                   └────────────┘
-                  (transcribe → classify → extract args → [tool] → LLM → TTS)
+                  (transcribe → classify+extract → [tools ∥] → LLM → TTS)
 ```
 
 ## UI Module Structure
