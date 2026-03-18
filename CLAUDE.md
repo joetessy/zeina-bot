@@ -67,16 +67,16 @@ There is no test suite, linter, or build step. The project is pure Python.
 ```
 Voice Mode:
   Spacebar → AudioRecorder (VAD) → Whisper transcription
-    → Intent Classification (3b model) → [Tool Execution] → LLM (8b model) → TTS → Auto-listen
+    → Classification + Arg Extraction (native tool calling, 7b model) → [Tool Execution ∥] → LLM (8b model) → TTS → Auto-listen
 
 Chat Mode:
-  Text input → Intent Classification → [Tool Execution] → LLM → Display (no TTS)
+  Text input → Classification + Arg Extraction → [Tool Execution ∥] → LLM → Display (no TTS)
 ```
 
 ### Key Modules (`zeina/` package — backend)
 
 - **assistant.py** - Main orchestrator. State machine, audio pipeline, LLM calls, tool integration. Central file that ties everything together.
-- **tools.py** - Tool framework with decorator-based registration (`@tool_manager.register`). Tools: `web_search`, `get_current_time`, `calculate`, `get_weather`, `get_location`, `read_file`, `list_directory`, `get_system_health`. Global `tool_manager` instance.
+- **tools/** - Tool package. `manager.py` has the `ToolManager` framework; each tool lives in its own module (`web.py`, `system.py`, `filesystem.py`, `clipboard.py`, `screenshot.py`, `memory.py`, `time_calc.py`, `ui_control.py`). All 14 tools register via `@tool_manager.register`. `__init__.py` re-exports `tool_manager`, `set_memory_callback`, `set_ui_control_callback`.
 - **audio.py** - `AudioRecorder` class. Microphone recording with Silero VAD. Auto-stops on silence (2s) or timeout (5s).
 - **tts.py** - `TTSEngine` using Piper TTS. Lazy-loads voice model, plays via pygame.
 - **display.py** / **display_protocol.py** - Legacy terminal Rich TUI + display protocol interface.
@@ -100,25 +100,22 @@ Chat Mode:
 
 ### Tool Integration Pattern
 
-Tools use a three-step approach to prevent the LLM from leaking tool reasoning:
-1. **Intent classification** — Two-stage process (see below). Returns a tool name or `none`.
-2. **Argument extraction** — A fast LLM call extracts structured args from the user's natural language (same classifier model). All tools use LLM-based extraction — no regex or token scanning.
-3. **Tool execution** — Result injected as a `[DATA]` user message, then the main LLM generates a natural response.
+Tools use a two-step approach:
+1. **Classification + argument extraction** — A single `ollama.chat(tools=...)` call using native tool calling. The classifier model (`qwen2.5:7b` default) receives tool schemas and returns structured tool calls with arguments already extracted. Multiple tools can be called in one request.
+2. **Tool execution** — Results injected as `[DATA]` user messages, then the main LLM generates a natural response.
 
-#### Two-stage Intent Classifier (`assistant.py:_classify_tool_intent`)
+#### Two-stage Classification (`assistant.py:_classify_and_extract`)
 
-`control_self` is the only tool that asks Zeina to change *herself*, making it semantically orthogonal to all other tools. It gets its own dedicated first stage:
+**Stage 0 — Python patterns for `control_self`**: Fast regex/keyword matching for UI control actions (theme changes, mode toggles, etc.). Zero-cost, reliable for closed vocabulary. Runs before the LLM call.
 
-**Stage 1 — `_check_control_self(message)`**: Binary YES/NO LLM call with a focused prompt. If YES → returns `control_self` immediately without running Stage 2.
+**Stage 1 — Native tool calling**: A single `ollama.chat(tools=tool_schemas)` call handles all other tools. The model sees tool JSON schemas and returns structured `tool_calls` with arguments. If Stage 0 already handled `control_self`, it's excluded from the schema to avoid duplication.
 
-**Stage 2 — main classifier**: Runs only when Stage 1 returns NO. Uses a multi-tool prompt covering all other tools. `control_self` is excluded from this list so it never competes with `execute_shell` or others.
-
-This keeps each stage's prompt simple and unambiguous. No hardcoded keyword guards anywhere.
+**Parallel execution**: Stateless tools (`web_search`, `get_weather`, `calculate`, etc.) run concurrently via `ThreadPoolExecutor`. Sequential tools (`take_screenshot`, `execute_shell`, `control_self`) run in order with UI guards.
 
 To add a new tool:
-1. Register it in `tools.py` with `@tool_manager.register(name, description, parameters)`
-2. If the tool is semantically unique like `control_self` (i.e. likely to be confused with others in the main prompt), give it its own stage-1 check in `_classify_tool_intent`. Otherwise, add a rule to the Stage 2 prompt.
-3. Add a `_build_tool_args()` branch that calls an LLM extractor (e.g. `_extract_location`, `_extract_path`, `_extract_shell_command`, or a new one following the same pattern)
+1. Create a new module in `zeina/tools/` (or add to an existing one) with `@tool_manager.register(name, description, parameters)`
+2. Import the module in `zeina/tools/__init__.py` to trigger registration
+3. The tool will automatically appear in the native tool calling schema — no prompt changes needed
 
 ### Observability
 
@@ -134,7 +131,7 @@ Output goes to **terminal only** — never to the GUI status bar. All events are
 
 Example terminal output at `"lite"`:
 ```
-[14:23:01] [LITE] Intent [llama3.2:3b]: web_search
+[14:23:01] [LITE] Intent [qwen2.5:7b]: web_search
 [14:23:02] [LITE] LLM [llama3.1:8b] (6 msgs)
 [14:23:04] [LITE] Response: 142 chars
 ```
@@ -192,7 +189,7 @@ Provides a comprehensive real-time report of the computer's health and performan
 
 All settings in `zeina/config.py`. Key ones:
 - `OLLAMA_MODEL` - Main LLM (default: `llama3.1:8b`)
-- `INTENT_CLASSIFIER_MODEL` - Fast classifier (default: `llama3.2:3b`)
+- `INTENT_CLASSIFIER_MODEL` - Tool-calling classifier (default: `qwen2.5:7b`)
 - `SYSTEM_PROMPT` - Optimized for voice output (brevity, no markdown, oral style)
 - `VAD_THRESHOLD`, `SILENCE_DURATION`, `LISTENING_TIMEOUT` - Voice detection tuning
 - `OBSERVABILITY_LEVEL` - `"off"` | `"lite"` | `"verbose"`
