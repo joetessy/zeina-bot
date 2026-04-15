@@ -1020,17 +1020,6 @@ class ZeinaAssistant:
             if _emit({"action": "set_menu_button", "value": _ui_show_hide(m)}):
                 return results
 
-        # ── Names (open-ended → LLM) ──────────────────────────────────────
-        # Use imperative-only patterns — "what's your name?" should NOT match.
-        if any(w in m for w in ("call you", "rename you", "your name to",
-                                "change your name", "bot name")):
-            if _emit({"action": "set_bot_name", "value": self._extract_name(message)}):
-                return results
-        if any(w in m for w in ("call me", "my name is", "user name is",
-                                "set my name")):
-            if _emit({"action": "set_user_name", "value": self._extract_name(message)}):
-                return results
-
         return results
 
     def _extract_ui_action(self, message: str) -> dict:

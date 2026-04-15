@@ -17,8 +17,7 @@ def set_ui_control_callback(cb) -> None:
         "switch color theme, change face animation style, toggle voice/chat mode, "
         "show/hide the status bar or chat feed, show/hide the menu button, "
         "mute/unmute TTS speech, clear conversation history, clear stored memories, "
-        "change the bot name or user name, switch profile, "
-        "or open the settings or diagnostics page."
+        "switch profile, or open the settings or diagnostics page."
     ),
     parameters={
         "type": "object",
@@ -29,7 +28,6 @@ def set_ui_control_callback(cb) -> None:
                     "set_theme", "set_animation", "set_mode",
                     "set_status_bar", "set_chat_feed", "set_tts_mute",
                     "clear_history", "clear_memories",
-                    "set_bot_name", "set_user_name",
                     "open_settings", "open_diagnostics",
                     "switch_profile", "set_menu_button",
                 ],
@@ -44,7 +42,6 @@ def set_ui_control_callback(cb) -> None:
                     "set_mode: voice|chat. "
                     "set_status_bar / set_chat_feed / set_menu_button: show|hide. "
                     "set_tts_mute: mute|unmute. "
-                    "set_bot_name / set_user_name: the new name. "
                     "switch_profile: the profile name. "
                     "Other actions: leave empty."
                 ),
