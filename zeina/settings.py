@@ -22,8 +22,7 @@ SETTINGS_PATH = config.SETTINGS_FILE
 
 DEFAULT_PROFILE = {
     "bot_name": "Zeina",
-    "ollama_model": "llama3.1:8b",
-    "intent_classifier_model": "llama3.2:3b",
+    "chat_model": "qwen2.5-7b",
     "tts_voice": "models/en_GB-southern_english_female-low.onnx",
     "silence_duration": 2.0,
     "listening_timeout": 5.0,
@@ -45,7 +44,7 @@ DEFAULT_PROFILE = {
     # User memory
     "memory_enabled": True,     # Extract and inject facts about the user
     # Vision
-    "vision_model": "moondream",    # Vision-capable model for screenshot/screen queries
+    "vision_model": "huihui-qwen3.6-27b-abliterated-mtp",  # Vision-capable model for screen queries
     # TTS
     "tts_speed": 1.0,               # Piper length_scale: <1.0 faster, >1.0 slower
     # Controls
@@ -89,7 +88,7 @@ MEMORY_CAP = 50  # Maximum facts stored per profile
 
 # settings.json holds only lightweight app-level state
 DEFAULT_APP_STATE = {
-    "version": 4,
+    "version": 5,
     "active_profile": "default",
 }
 
@@ -138,6 +137,7 @@ class Settings:
         self._app = self._load_app_state()
         self._migrate_old_format()
         self._migrate_to_sessions()
+        self._migrate_model_keys()
         self._ensure_default_profile()
         self._profile_cache = self._load_profile(self.active_profile_name)
         self._cleanup_broken_exports()
@@ -255,12 +255,41 @@ class Settings:
                         session = {
                             "started": datetime.now().isoformat(),
                             "profile": profile_name,
-                            "model": config.OLLAMA_MODEL,
+                            "model": config.CHAT_MODEL,
                             "messages": messages,
                         }
                         _atomic_write(legacy_path, session)
 
                 # Re-save profile without conversation_history
+                _atomic_write(entry.path, data)
+        except OSError:
+            pass
+
+    def _migrate_model_keys(self) -> None:
+        """Migrate Ollama-era model keys to the OpenAI-compatible scheme.
+
+        The old keys (`ollama_model`, `intent_classifier_model`) held Ollama ids
+        like ``llama3.1:8b``. The new backend (llama.cpp / llama-swap, Ollama's
+        /v1, etc.) uses different ids (``llama3.1-8b``), so the old values are not
+        portable. We strip them and let the ``chat_model`` default take over;
+        the user re-selects a served model from the live /v1/models list.
+        """
+        if not os.path.isdir(config.PROFILES_DIR):
+            return
+        try:
+            for entry in os.scandir(config.PROFILES_DIR):
+                if not entry.name.endswith('.json'):
+                    continue
+                try:
+                    with open(entry.path) as f:
+                        data = json.load(f)
+                except (json.JSONDecodeError, IOError):
+                    continue
+                if "ollama_model" not in data and "intent_classifier_model" not in data:
+                    continue
+                data.pop("ollama_model", None)
+                data.pop("intent_classifier_model", None)
+                data.setdefault("chat_model", DEFAULT_PROFILE["chat_model"])
                 _atomic_write(entry.path, data)
         except OSError:
             pass
@@ -371,7 +400,7 @@ class Settings:
         return {
             "started": datetime.now().isoformat(),
             "profile": profile_name,
-            "model": config.OLLAMA_MODEL,
+            "model": config.CHAT_MODEL,
             "messages": [],
         }
 
@@ -564,8 +593,7 @@ class Settings:
         profile = self.get_all()
 
         config.ACTIVE_PROFILE = self.active_profile_name
-        config.OLLAMA_MODEL = profile.get("ollama_model", config.OLLAMA_MODEL)
-        config.INTENT_CLASSIFIER_MODEL = profile.get("intent_classifier_model", config.INTENT_CLASSIFIER_MODEL)
+        config.CHAT_MODEL = profile.get("chat_model", config.CHAT_MODEL)
         config.SILENCE_DURATION = profile.get("silence_duration", config.SILENCE_DURATION)
         config.LISTENING_TIMEOUT = profile.get("listening_timeout", config.LISTENING_TIMEOUT)
         config.VAD_THRESHOLD = profile.get("vad_threshold", config.VAD_THRESHOLD)

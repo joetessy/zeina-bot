@@ -11,8 +11,9 @@ class Tool:
     function: Callable
     parameters: Dict[str, Any]
 
-    def to_ollama_schema(self) -> Dict[str, Any]:
-        """Convert tool to Ollama function calling schema"""
+    def to_openai_schema(self) -> Dict[str, Any]:
+        """Convert tool to the OpenAI function-calling schema (used by any
+        OpenAI-compatible backend: llama.cpp, Ollama, etc.)."""
         return {
             "type": "function",
             "function": {
@@ -61,9 +62,9 @@ class ToolManager:
             return f"Error: Tool '{name}' not found"
         return tool.execute(**arguments)
 
-    def get_ollama_tools(self) -> List[Dict[str, Any]]:
-        """Get all tools in Ollama function calling format"""
-        return [tool.to_ollama_schema() for tool in self.tools.values()]
+    def get_tool_schemas(self) -> List[Dict[str, Any]]:
+        """Get all tools in OpenAI function-calling format."""
+        return [tool.to_openai_schema() for tool in self.tools.values()]
 
     def has_tools(self) -> bool:
         """Check if any tools are registered"""

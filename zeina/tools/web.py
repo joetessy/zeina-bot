@@ -1,6 +1,56 @@
 """Web tools — web_search, get_weather, get_location."""
 import os
+import logging
 from .manager import tool_manager
+from zeina import config
+
+# Quiet the noisy HTTP libraries the search backends pull in.
+for _noisy in ("ddgs", "curl_cffi", "httpx", "httpcore", "urllib3"):
+    logging.getLogger(_noisy).setLevel(logging.ERROR)
+
+
+def _format_results(query: str, items: list[dict]) -> str:
+    """Render a list of {title, body, url} dicts into a compact text block."""
+    if not items:
+        return f"No results found for: {query}"
+    out = f"Search results for '{query}':\n\n"
+    for i, r in enumerate(items, 1):
+        out += f"{i}. {r.get('title') or 'No title'}\n   {r.get('body') or 'No description'}\n"
+        if r.get("url"):
+            out += f"   Source: {r['url']}\n"
+        out += "\n"
+    return out.strip()
+
+
+def _searxng_search(query: str, base_url: str, max_results: int = 5) -> list[dict]:
+    """Query a self-hosted SearXNG instance's JSON API."""
+    import requests
+
+    base = base_url.rstrip("/")
+    url = base if base.endswith("/search") else f"{base}/search"
+    resp = requests.get(
+        url,
+        params={"q": query, "format": "json"},
+        headers={"User-Agent": "Zeina/1.0"},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return [
+        {"title": r.get("title"), "body": r.get("content"), "url": r.get("url")}
+        for r in data.get("results", [])[:max_results]
+    ]
+
+
+def _ddgs_search(query: str, max_results: int = 5) -> list[dict]:
+    """Query DuckDuckGo via the ddgs library (no API key, no extra service)."""
+    from ddgs import DDGS
+
+    results = DDGS().text(query, max_results=max_results)
+    return [
+        {"title": r.get("title"), "body": r.get("body"), "url": r.get("href")}
+        for r in results
+    ]
 
 
 @tool_manager.register(
@@ -18,36 +68,24 @@ from .manager import tool_manager
     }
 )
 def web_search(query: str) -> str:
-    """Search the web using DuckDuckGo."""
+    """Search the web.
+
+    Uses a self-hosted SearXNG instance when ``ZEINA_SEARXNG_URL`` is configured
+    (private, no rate limits), otherwise DuckDuckGo via ddgs. If SearXNG is set
+    but unreachable, falls back to ddgs so search keeps working.
+    """
+    searxng = getattr(config, "SEARXNG_URL", "")
+    if searxng:
+        try:
+            return _format_results(query, _searxng_search(query, searxng))
+        except Exception as e:
+            # Don't fail the turn — fall back to the zero-dependency backend.
+            pass
+
     try:
-        from ddgs import DDGS
+        return _format_results(query, _ddgs_search(query))
     except ImportError:
         return "Error: ddgs library not installed. Run: pip install ddgs"
-
-    try:
-        import logging
-        for _noisy in ("ddgs", "curl_cffi", "httpx", "httpcore", "urllib3"):
-            logging.getLogger(_noisy).setLevel(logging.ERROR)
-
-        from ddgs.http_client import HttpClient
-        HttpClient._impersonates = ("random",)
-        results = DDGS().text(query, max_results=5)
-
-        if not results:
-            return f"No results found for: {query}"
-
-        formatted = f"Search results for '{query}':\n\n"
-        for i, result in enumerate(results, 1):
-            title = result.get('title', 'No title')
-            snippet = result.get('body', 'No description')
-            url = result.get('href', '')
-            formatted += f"{i}. {title}\n   {snippet}\n"
-            if url:
-                formatted += f"   Source: {url}\n"
-            formatted += "\n"
-
-        return formatted.strip()
-
     except Exception as e:
         return f"Error performing web search: {str(e)}"
 

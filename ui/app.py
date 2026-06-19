@@ -798,16 +798,10 @@ class ZeinaApp(App):
 
     def _show_model_selector(self):
         """Show a Kivy Popup for model selection."""
-        try:
-            import ollama
-            models_response = ollama.list()
-            models = models_response.models
-        except Exception as e:
-            self._status.set_status(f"Error listing models: {e}", "red")
-            return
-
+        from zeina import llm
+        models = llm.list_model_ids()
         if not models:
-            self._status.set_status("No models found", "red")
+            self._status.set_status("No models served (is the model server running?)", "red")
             return
 
         bot_name = self._settings.get("bot_name", "Zeina")
@@ -842,15 +836,14 @@ class ZeinaApp(App):
         )
 
         def select_model(model_name):
-            if model_name != config.OLLAMA_MODEL:
-                config.OLLAMA_MODEL = model_name
-                self._settings.set("ollama_model", model_name)
+            if model_name != config.CHAT_MODEL:
+                config.CHAT_MODEL = model_name
+                self._settings.set("chat_model", model_name)
                 self._kivy_display.show_menu_bar(self._assistant.mode, bot_name)
             popup.dismiss()
 
-        for model in models:
-            name = model.model
-            is_current = name == config.OLLAMA_MODEL
+        for name in models:
+            is_current = name == config.CHAT_MODEL
             btn = Button(
                 text=f"> {name}" if is_current else f"  {name}",
                 size_hint_y=None,

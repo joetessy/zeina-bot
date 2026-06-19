@@ -329,10 +329,10 @@ class SettingsScreen(FloatLayout):
 
         # ── AI Model ──
         H("AI Model")
-        self._add_model_spinner(s, "Main Model", "ollama_model",
-                                profile.get("ollama_model", "llama3.1:8b"), font=font)
-        self._add_model_spinner(s, "Classifier Model", "intent_classifier_model",
-                                profile.get("intent_classifier_model", "qwen2.5:3b"), font=font)
+        self._add_model_spinner(s, "Main Model", "chat_model",
+                                profile.get("chat_model", "qwen2.5-7b"), font=font)
+        self._add_model_spinner(s, "Vision Model", "vision_model",
+                                profile.get("vision_model", config.VISION_MODEL), font=font)
 
         # ── Voice ──
         H("Voice")
@@ -608,9 +608,8 @@ class SettingsScreen(FloatLayout):
         row = SettingRow(label, font_name=font, even=self._next_even())
         models = [current]
         try:
-            import ollama
-            resp = ollama.list()
-            model_names = [m.model for m in resp.models]
+            from zeina import llm
+            model_names = llm.list_model_ids()
             if model_names:
                 models = model_names
                 if current not in models:

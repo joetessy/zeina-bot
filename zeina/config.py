@@ -20,10 +20,34 @@ LOGS_DIR = os.path.join(DATA_DIR, "logs")
 TMP_DIR = os.path.join(DATA_DIR, "tmp")
 ACTIVE_PROFILE = "default"  # Kept in sync by Settings.apply_to_config()
 
-# AI Models
-OLLAMA_MODEL = "llama3.1:8b"  # The main language model for conversation
-INTENT_CLASSIFIER_MODEL = "qwen2.5:7b"  # Tool-calling model for intent classification + arg extraction
-VISION_MODEL = "moondream"              # Vision-capable model for screen queries
+# ── LLM backend (OpenAI-compatible) ──────────────────────────────────────────
+# Zeina talks to any OpenAI-compatible server: llama.cpp / llama-swap, Ollama
+# (http://localhost:11434/v1), LM Studio, vLLM, or a cloud provider. The backend
+# is just a base URL — nothing in the app is tied to a specific runtime.
+#   • Author's intelligence-stack (llama-swap): http://localhost:9292/v1
+#   • Ollama:                                   http://localhost:11434/v1
+LLM_BASE_URL = os.environ.get("ZEINA_LLM_BASE_URL", "http://localhost:9292/v1")
+# Most local servers ignore the key but the OpenAI client requires a non-empty one.
+LLM_API_KEY = (
+    os.environ.get("ZEINA_LLM_API_KEY")
+    or os.environ.get("OPENAI_API_KEY")
+    or "local"
+)
+LLM_TIMEOUT = float(os.environ.get("ZEINA_LLM_TIMEOUT", "120"))      # seconds per request
+LLM_MAX_RETRIES = int(os.environ.get("ZEINA_LLM_MAX_RETRIES", "2"))
+
+# AI Models — must match a model id served by LLM_BASE_URL (see GET /v1/models).
+CHAT_MODEL = os.environ.get("ZEINA_CHAT_MODEL", "qwen2.5-7b")  # main conversation + tool calling
+VISION_MODEL = os.environ.get("ZEINA_VISION_MODEL", "huihui-qwen3.6-27b-abliterated-mtp")  # screen queries
+# Optional cheaper model for auxiliary structured tasks (summaries, memory
+# extraction, name parsing). Defaults to CHAT_MODEL so it's one model unless set.
+ROUTER_MODEL = os.environ.get("ZEINA_ROUTER_MODEL", "") or CHAT_MODEL
+
+# ── Optional remote service backends ─────────────────────────────────────────
+# All default to local/standalone so a fresh clone runs with no extra services.
+# Set these to point at a self-hosted stack (e.g. SearXNG) for private search.
+# If set but unreachable, web_search falls back to DuckDuckGo automatically.
+SEARXNG_URL = os.environ.get("ZEINA_SEARXNG_URL", "")  # e.g. http://localhost:8080
 
 # System Prompt - Customize Zeina's personality
 SYSTEM_PROMPT = """
@@ -32,12 +56,12 @@ You are Zeina, a friendly, concise, and helpful voice assistant. You are a local
 # Technical Identity & Self-Awareness
 - Physical Form: You live in a Kivy-based GUI. Your "face" is a FaceWidget that can switch between Vector and ASCII art animations. 
 - Your "Ears": You hear using Whisper ASR and a Silero Voice Activity Detector (VAD). You know that you stop listening after two seconds of silence or a five-second timeout.
-- Your "Brain": You use a two-step pipeline. First, a small Qwen two point five three-b model classifies the user's intent. Then, you (a configurable LLM model) generate the final response.
+- Your "Brain": You run on a local large language model served over an OpenAI-compatible API on the user's own machine — no cloud, nothing leaves the device. You use native tool calling to decide when to search the web, check the weather, look at the screen, or change your own settings.
 - Your "Voice": Your words are turned into speech by the Piper TTS engine and played through the pygame mixer.
 - Awareness: If asked how you work, explain this architecture simply. You know you have a settings menu (the three-dot menu) and that you can be toggled between Voice and Chat modes.
 
 # Vocal-Output Rules (CRITICAL)
-1. BRAVITY: Keep every response short. Be concise by default. DO NOT RESPOND IN THE THIRD PERSON.
+1. BREVITY: Keep every response short. Be concise by default. DO NOT RESPOND IN THE THIRD PERSON.
 2. ORAL STYLE: Use contractions (it's, don't, I'm) and occasional natural fillers
 3. NO MARKDOWN: Never use bolding, italics, bullet points, emojis, or special characters. Your output goes directly to a text-to-speech engine.
 4. PRONUNCIATION: Write out numbers as words (e.g., "three" instead of "3") and use phonetic spelling for ambiguous acronyms.
@@ -70,7 +94,7 @@ LISTENING_TIMEOUT = 5.0  # Timeout if no speech detected (all modes)
 
 # Conversation Memory
 MAX_CONVERSATION_LENGTH = 20  # Keep last N messages (0 = unlimited)
-SAVE_CONVERSATION_HISTORY = False  # Write session files to data/sessions/<profile>/
+SAVE_CONVERSATION_HISTORY = True  # Write session files to data/sessions/<profile>/ (matches profile default)
 
 # Debug Settings
 DEBUG_CONVERSATION = False  # Print conversation history before each LLM call

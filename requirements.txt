@@ -1,20 +1,31 @@
-openai-whisper
-ollama
-sounddevice
-soundfile
-numpy
-pynput
-piper-tts
-torch
-torchaudio
-silero-vad
-pygame
-rich
-ddgs
-pytz
-requests
-python-dotenv
-kivy
-psutil
-mss
-Pillow
+# LLM backend — OpenAI-compatible client (llama.cpp/llama-swap, Ollama, LM Studio, cloud)
+openai>=1.40,<3
+
+# Speech-to-text (local, in-process)
+openai-whisper>=20231117
+
+# Voice activity detection + tensor backend (Silero VAD requires torch)
+torch>=2.2
+torchaudio>=2.2
+silero-vad>=5.1
+
+# Audio I/O + playback
+sounddevice>=0.4.6
+soundfile>=0.12
+pygame>=2.5
+
+# Text-to-speech (local)
+piper-tts>=1.2
+
+# GUI
+kivy>=2.3
+
+# Tools & utilities
+numpy>=1.26
+ddgs>=9.0
+pytz>=2024.1
+requests>=2.31
+python-dotenv>=1.0
+psutil>=5.9
+mss>=9.0
+Pillow>=10.0

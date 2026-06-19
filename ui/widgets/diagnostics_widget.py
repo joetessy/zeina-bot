@@ -262,7 +262,7 @@ class DiagnosticsWidget(FloatLayout):
         """Pull current values from the assistant object."""
         if assistant is None:
             return
-        self._model_lbl[1].text = config.OLLAMA_MODEL
+        self._model_lbl[1].text = config.CHAT_MODEL
         self._conv_lbl[1].text = f"{len(assistant.conversation_history)} messages"
         self._tool_lbl[1].text = ", ".join(assistant._last_tools_used) or "none"
 

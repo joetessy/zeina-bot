@@ -97,10 +97,8 @@ class KivyDisplay:
         self.face_visible = True
 
     def update_face_state(self, recording_state: RecordingState, is_speaking: bool = False):
-        from zeina.face import Face
-        # Reuse the same state mapping logic
-        face = Face()
-        state_str = face.get_state_from_recording_state(recording_state, is_speaking)
+        from zeina.enums import face_state_from_recording
+        state_str = face_state_from_recording(recording_state, is_speaking)
         def _update(dt):
             self.face_widget.set_state(state_str)
         Clock.schedule_once(_update, 0)

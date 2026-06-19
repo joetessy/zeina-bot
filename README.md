@@ -13,7 +13,8 @@ A voice-activated AI assistant built entirely with open-source tools. Talk natur
 - **Screen Vision**: Ask Zeina what's on your screen — she takes a screenshot, interprets it with a vision model, and responds naturally
 - **Animated Face**: Vector (procedural) and ASCII art animation modes
 - **Settings UI**: Full-screen settings overlay with profiles, themes, and voice control
-- **Model Switching**: Change Ollama models on the fly with Ctrl+M or via settings
+- **Model Switching**: Change the chat model on the fly with Ctrl+M or via settings
+- **Backend-agnostic**: Works with any OpenAI-compatible server — llama.cpp/llama-swap, Ollama, LM Studio, or a cloud provider
 - **Themes**: Default, Midnight, Terminal, Sunset, and Ocean color themes
 - **Profiles**: Multiple named profiles with independent settings and AI context
 - **Diagnostics**: Ctrl+D overlay showing live assistant state, event log, and deletable memories
@@ -67,12 +68,21 @@ A voice-activated AI assistant built entirely with open-source tools. Talk natur
 
 1. **Python 3.10+**
 
-2. **Ollama** — local LLM runtime
-   ```bash
-   # Install from https://ollama.ai
-   # macOS/Linux:
-   curl -fsSL https://ollama.ai/install.sh | sh
-   ```
+2. **An OpenAI-compatible model server.** Zeina is backend-agnostic — it talks
+   to any server that speaks the OpenAI `/v1` API. Pick whichever you prefer:
+
+   | Runtime | Base URL | Notes |
+   |---------|----------|-------|
+   | [llama.cpp](https://github.com/ggml-org/llama.cpp) `llama-server` | `http://localhost:8080/v1` | Single model |
+   | [llama-swap](https://github.com/mostlygeek/llama-swap) | `http://localhost:9292/v1` | Multi-model hot-swap (Zeina's default) |
+   | [Ollama](https://ollama.com) | `http://localhost:11434/v1` | `ollama serve` |
+   | [LM Studio](https://lmstudio.ai) | `http://localhost:1234/v1` | Local server toggle |
+   | A cloud provider | that provider's `/v1` | Set the API key |
+
+   Point Zeina at your server with `ZEINA_LLM_BASE_URL` (see `.env.example`).
+   The chat model needs tool/function-calling support — for llama.cpp run
+   `llama-server` with `--jinja`. A vision-capable model (with an `mmproj`
+   projector) is needed for the "look at my screen" feature.
 
 3. **PortAudio** — required by sounddevice for microphone access
    ```bash
@@ -121,19 +131,21 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### Pull Ollama Models
+### Configure the model
 
-Zeina uses two Ollama models. Pull both before running:
+Copy `.env.example` to `.env` and set `ZEINA_LLM_BASE_URL` plus the model ids to
+match what your server reports at `GET /v1/models`:
 
 ```bash
-# Main conversation model (~4.7 GB)
-ollama pull llama3.1:8b
-
-# Fast intent classifier with native tool calling (~4.7 GB)
-ollama pull qwen2.5:7b
+cp .env.example .env
+# then edit ZEINA_LLM_BASE_URL / ZEINA_CHAT_MODEL / ZEINA_VISION_MODEL
 ```
 
-You can change both models from Settings > AI Model. The main model is also switchable via Ctrl+M.
+Zeina runs a single chat model in a unified tool-calling loop (it both decides
+when to use a tool and writes the reply), plus an optional vision model for
+screen queries. Both are selectable from **Settings > AI Model**, and the chat
+model is switchable on the fly via **Ctrl+M** — the picker lists whatever your
+server is serving.
 
 ### Download a Piper TTS Voice
 
@@ -154,17 +166,14 @@ Browse all available voices at [huggingface.co/rhasspy/piper-voices](https://hug
 ## Running
 
 ```bash
-# Start Ollama (if not already running as a service)
-ollama serve
+# Make sure your model server is running and reachable at ZEINA_LLM_BASE_URL
+# (e.g. `ollama serve`, or your llama.cpp / llama-swap service).
 
 # Activate the virtual environment
 source venv/bin/activate
 
-# Launch the GUI (primary interface)
+# Launch the GUI
 python gui_main.py
-
-# Or run the legacy terminal mode
-python main.py
 ```
 
 ## Controls
@@ -173,7 +182,7 @@ python main.py
 |-----|--------|
 | `SPACEBAR` | Push to talk / stop recording / interrupt TTS |
 | `TAB` | Toggle between Voice and Chat mode |
-| `Ctrl+M` | Change Ollama model |
+| `Ctrl+M` | Change chat model |
 | `Ctrl+D` | Toggle diagnostics overlay |
 | `ESC` | Close overlay or quit |
 
@@ -229,10 +238,14 @@ The weather tool requires a free OpenWeatherMap API key:
 
 Most settings are managed through the in-app Settings screen (⚙ icon). For low-level tuning, edit `zeina/config.py`:
 
+Backend selection lives in environment variables (see `.env.example`):
+`ZEINA_LLM_BASE_URL`, `ZEINA_LLM_API_KEY`, `ZEINA_CHAT_MODEL`, `ZEINA_VISION_MODEL`,
+and the optional `ZEINA_SEARXNG_URL`. The rest are in `zeina/config.py`:
+
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `OLLAMA_MODEL` | `llama3.1:8b` | Main conversation model |
-| `INTENT_CLASSIFIER_MODEL` | `qwen2.5:7b` | Tool-calling classifier (native tool calling) |
+| `CHAT_MODEL` | `qwen2.5-7b` | Main conversation + tool-calling model |
+| `VISION_MODEL` | `huihui-qwen3.6-27b-abliterated-mtp` | Vision model for screen queries |
 | `WHISPER_MODEL` | `base` | ASR model size (`tiny`, `base`, `small`, `medium`, `large-v3`) |
 | `WHISPER_DEVICE` | `cpu` | Use `cuda` for GPU acceleration |
 | `TTS_VOICE` | `models/en_GB-southern_english_female-low.onnx` | Piper voice model path |
@@ -243,9 +256,10 @@ Most settings are managed through the in-app Settings screen (⚙ icon). For low
 
 ## Troubleshooting
 
-**"Ollama connection failed"**
-- Ensure Ollama is running: `ollama serve`
-- Check models are pulled: `ollama list`
+**"Can't reach the model server"**
+- Ensure your OpenAI-compatible server is running and reachable at `ZEINA_LLM_BASE_URL`
+- Confirm the configured model is served: `curl $ZEINA_LLM_BASE_URL/models`
+- The startup log prints the served model ids and warns if `ZEINA_CHAT_MODEL` isn't among them
 
 **"No speech detected"**
 - Check your microphone is selected and working
@@ -261,7 +275,7 @@ Most settings are managed through the in-app Settings screen (⚙ icon). For low
 
 **Slow performance**
 - Use `tiny` or `base` Whisper model (Settings > Voice or `config.py`)
-- Use a smaller Ollama model (`llama3.2:3b` for fast responses)
+- Use a smaller chat model (set `ZEINA_CHAT_MODEL` to a lighter model your server serves)
 - Enable GPU: set `WHISPER_DEVICE = "cuda"` in `config.py`
 
 **Kivy window won't open**
@@ -291,4 +305,4 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed pipeline and compo
 
 ## Credits
 
-Built with [Kivy](https://kivy.org), [Whisper](https://github.com/openai/whisper), [Ollama](https://ollama.ai), [Piper TTS](https://github.com/rhasspy/piper), [Silero VAD](https://github.com/snakers4/silero-vad), [DuckDuckGo Search](https://github.com/deedy5/ddgs), and [psutil](https://github.com/giampaolo/psutil).
+Built with [Kivy](https://kivy.org), [Whisper](https://github.com/openai/whisper), [llama.cpp](https://github.com/ggml-org/llama.cpp) (via any OpenAI-compatible server), the [OpenAI Python SDK](https://github.com/openai/openai-python), [Piper TTS](https://github.com/rhasspy/piper), [Silero VAD](https://github.com/snakers4/silero-vad), [DuckDuckGo Search](https://github.com/deedy5/ddgs), and [psutil](https://github.com/giampaolo/psutil).
