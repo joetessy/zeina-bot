@@ -75,27 +75,36 @@ Chat Mode:
 
 ### Key Modules (`zeina/` package — backend)
 
-- **assistant.py** - Main orchestrator. State machine, audio pipeline, the unified tool-calling loop, tool execution, vision, TTS. Central file the Kivy app drives.
+- **assistant.py** - Main orchestrator. State machine, audio pipeline, the unified tool-calling loop, tool execution. Central file the Kivy app drives.
 - **llm.py** - The single LLM seam. Thin wrapper over the `openai` SDK pointed at `config.LLM_BASE_URL`: `chat()` (stream + non-stream), `parse_tool_calls()`, `assistant_tool_call_msg()`, `list_model_ids()`, `health()`, `image_data_uri()`.
+- **types.py** - Shared TypedDicts: `ChatMessage`, `ToolCall`, `UIAction`, `ToolSchema`.
+- **display.py** - `DisplayProtocol` — the structural interface the backend renders through; `ui.kivy_display.KivyDisplay` implements it.
+- **ui_intents.py** - Stage-0 regex matching for `control_self` actions (pure functions).
+- **history.py** - Router-model helpers: `extract_name()`, `summarize_history()`.
+- **vision.py** - `describe_screenshot()` — validates/resizes a capture and runs the vision model.
+- **speech.py** - `SpeechPipeline` — sentence-level TTS streaming with interrupt handling.
 - **memory_extractor.py** - Background extraction of durable user facts (JSON-object output, first-person gate). Runs on a worker thread after non-tool turns.
-- **tools/** - Tool package. `manager.py` has the `ToolManager` framework (`to_openai_schema`, `get_tool_schemas`); each tool lives in its own module (`web.py`, `system.py`, `filesystem.py`, `clipboard.py`, `screenshot.py`, `memory.py`, `time_calc.py`, `ui_control.py`). All 14 tools register via `@tool_manager.register`. `__init__.py` re-exports `tool_manager`, `set_memory_callback`, `set_ui_control_callback`.
-- **audio.py** - `AudioRecorder` class. Microphone recording with Silero VAD. Auto-stops on silence (2s) or timeout (5s).
+- **tools/** - Tool package. `manager.py` has the `ToolManager` framework (`to_openai_schema`, `get_tool_schemas(exclude=...)`); each tool lives in its own module (`web.py`, `system.py`, `filesystem.py`, `clipboard.py`, `screenshot.py`, `memory.py`, `time_calc.py`, `ui_control.py`). All 14 tools register via `@tool_manager.register`. `__init__.py` re-exports `tool_manager`, `set_memory_callback`, `set_ui_control_callback`.
+- **audio.py** - `AudioRecorder` class. Microphone recording with Silero VAD. Auto-stops on silence or timeout (live-configurable).
 - **tts.py** - `TTSEngine` using Piper TTS. Lazy-loads voice model, plays via pygame.
 - **config.py** - All configuration constants. LLM backend (base URL, models), audio settings, VAD thresholds, system prompt.
 - **enums.py** - `RecordingState` (IDLE/LISTENING/PROCESSING), `InteractionMode` (VOICE/CHAT), `face_state_from_recording()` helper.
-- **settings.py** - JSON persistence with per-profile settings, atomic writes, memory facts, schema migrations.
+- **settings.py** - `Settings` class: per-profile JSON persistence, sessions, memory facts. Collaborators: `settings_defaults.py` (templates), `storage.py` (atomic writes + paths), `migrations.py` (on-disk format upgrades), `prompt_builder.py` (system prompt assembly).
 
 ### Key Modules (`ui/` package — Kivy GUI layer)
 
-- **app.py** - Main Kivy app. FloatLayout wrapper, keyboard handling (Kivy Window events), dropdown menu, mode toggle, assistant init.
-- **kivy_display.py** - `KivyDisplay` — implements the display protocol for Kivy, bridging the backend to GUI widgets.
+- **app.py** - Main Kivy app. FloatLayout wrapper, keyboard handling (Kivy Window events), mode toggle, assistant init, shutdown.
+- **menu.py** - `DropdownMenu` — the floating "..." icon menu (status bar / chat feed / mute / settings).
+- **model_selector.py** - `show_model_selector()` — Ctrl+M popup listing served models.
+- **ui_control.py** - `UIControlHandler` — executes `control_self` actions against the running app (called from tool threads, marshals to the main thread).
+- **kivy_display.py** - `KivyDisplay` — implements `zeina.display.DisplayProtocol`, bridging the backend to GUI widgets.
 - **themes.py** - `ThemeManager` with 4 built-in themes: `default`, `midnight`, `terminal`, `sunset`.
 - **animation_themes.py** - `BotRenderer` (vector) and `ASCIIRenderer` (text-based) for the face widget.
 - **icons.py** - MDI webfont registration and icon codepoint map. `icon(name)` helper returns the character.
 - **widgets/face_widget.py** - Canvas-drawn animated face. 24fps, 4 states (idle/listening/processing/speaking).
 - **widgets/status_widget.py** - 3-section status bar: mode badge (left) | status text (center) | bot name (right).
 - **widgets/chat_widget.py** - Messenger-style chat bubbles + text input. Streaming token append support.
-- **widgets/settings_screen.py** - Full-screen settings overlay. 10 sections covering all profile settings.
+- **widgets/settings/** - Full-screen settings overlay package: `screen.py` (`SettingsScreen`), `builders.py` (row-builder mixin), `rows.py` (row/header widgets), `dialogs.py` (shared confirm/info popups).
 - **widgets/diagnostics_widget.py** - Ctrl+D overlay showing live assistant state and event log.
 
 ### Tool Integration Pattern — unified loop (`assistant.py:_get_llm_response`)
@@ -183,8 +192,9 @@ Provides a comprehensive real-time report of the computer's health and performan
 - Audio stream thread: sounddevice microphone callbacks
 - Background daemon thread: assistant initialization (keeps UI responsive on startup)
 - Spawned daemon threads: audio processing pipeline (transcription → LLM → TTS), GUI chat input loop, TTS sentence synthesis
-- Background (non-daemon) threads: memory extraction, tracked in `assistant._memory_threads` and joined on shutdown
+- Background daemon threads: memory extraction, tracked in `assistant._memory_threads` and given a bounded join grace period at shutdown (`wait_for_background_work`)
 - Thread safety: `threading.Lock()` for state, mode, and speaking transitions
+- Shutdown: `ui/app.py:_shutdown` hides the window, then runs all audio teardown on a watchdog thread with a hard 12s deadline (TTS `close()` → `pygame.mixer.quit()` → mic `stream.abort()/close()` → memory join). Order matters — stopping the PortAudio mic stream while pygame output is live on the same CoreAudio device can deadlock in `AudioOutputUnitStop`. If native teardown wedges, the watchdog force-exits.
 
 ### Configuration
 

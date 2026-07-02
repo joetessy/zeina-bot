@@ -18,7 +18,8 @@
       "Bash(venv/bin/python:*)",
       "Bash(grep:*)",
       "WebFetch(domain:github.com)",
-      "Bash(find:*)"
+      "Bash(find:*)",
+      "Bash(echo \"=== .env.example ===\" && cat .env.example 2>/dev/null && echo \"\" && echo \"=== .env \\(keys only\\) ===\" && sed 's/=.*/=<redacted>/' .env 2>/dev/null && echo \"\" && echo \"=== README head ===\" && head -40 README.md 2>/dev/null)"
     ]
   }
 }

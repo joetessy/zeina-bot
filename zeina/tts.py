@@ -25,6 +25,7 @@ class TTSEngine:
         self.voice = voice
         self.is_speaking = False
         self.piper_voice = None
+        self._closed = False  # once set, no new playback may start (app shutdown)
 
         self._initialize_engine()
 
@@ -48,10 +49,26 @@ class TTSEngine:
             self.is_speaking = False
 
     def stop(self):
-        """Stop current speech playback"""
-        if self.is_speaking:
+        """Stop current speech playback.
+
+        Unconditional: a play_file() that hasn't set is_speaking yet must not
+        slip past an interrupt, so we don't gate on the flag.
+        """
+        self.is_speaking = False
+        try:
             pygame.mixer.music.stop()
-            self.is_speaking = False
+        except pygame.error:
+            pass  # mixer already quit
+
+    def close(self):
+        """Permanently stop playback ahead of app shutdown.
+
+        After this, play_file() discards instead of playing — required before
+        the mic stream is stopped, because live pygame output and a PortAudio
+        stop on the same CoreAudio device can deadlock.
+        """
+        self._closed = True
+        self.stop()
 
     def synthesize_to_file(self, text: str) -> str:
         """Synthesize text to a temp WAV file and return its path.
@@ -80,12 +97,22 @@ class TTSEngine:
 
     def play_file(self, path: str) -> None:
         """Play a WAV file produced by synthesize_to_file(), block until done, then delete it."""
+        if self._closed:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            return
         self.is_speaking = True
         try:
             pygame.mixer.music.load(path)
+            if self._closed or not self.is_speaking:  # close()/stop() raced the load
+                return
             pygame.mixer.music.play()
             while pygame.mixer.music.get_busy() and self.is_speaking:
                 time.sleep(0.05)
+        except pygame.error:
+            pass  # mixer quit mid-playback during shutdown
         finally:
             self.is_speaking = False
             try:

@@ -1,10 +1,14 @@
 """UI control tool — controls the app's own interface."""
+from typing import Callable, Optional
+
 from .manager import tool_manager
 
-_ui_control_callback = None
+UIControlCallback = Callable[[str, str], str]
+
+_ui_control_callback: Optional[UIControlCallback] = None
 
 
-def set_ui_control_callback(cb) -> None:
+def set_ui_control_callback(cb: UIControlCallback) -> None:
     """Register a callback(action: str, value: str) that controls the app UI."""
     global _ui_control_callback
     _ui_control_callback = cb
@@ -17,7 +21,8 @@ def set_ui_control_callback(cb) -> None:
         "switch color theme, change face animation style, toggle voice/chat mode, "
         "show/hide the status bar or chat feed, show/hide the menu button, "
         "mute/unmute TTS speech, clear conversation history, clear stored memories, "
-        "switch profile, or open the settings or diagnostics page."
+        "switch profile, rename the bot or the user, or open the settings or "
+        "diagnostics page."
     ),
     parameters={
         "type": "object",
@@ -30,6 +35,7 @@ def set_ui_control_callback(cb) -> None:
                     "clear_history", "clear_memories",
                     "open_settings", "open_diagnostics",
                     "switch_profile", "set_menu_button",
+                    "set_bot_name", "set_user_name",
                 ],
                 "description": "The UI action to perform",
             },
@@ -43,6 +49,7 @@ def set_ui_control_callback(cb) -> None:
                     "set_status_bar / set_chat_feed / set_menu_button: show|hide. "
                     "set_tts_mute: mute|unmute. "
                     "switch_profile: the profile name. "
+                    "set_bot_name / set_user_name: the new name. "
                     "Other actions: leave empty."
                 ),
             },

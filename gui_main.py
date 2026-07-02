@@ -24,7 +24,7 @@ for _lib in ("httpx", "httpcore", "hpack", "urllib3", "piper", "piper.voice"):
 try:
     import pygame
     pygame.mixer.init(frequency=22050, size=-16, channels=1, buffer=512)
-except (ImportError, pygame.error) as e:
+except Exception as e:
     # TTS will handle this if pygame fails to initialize
     print(f"Warning: pygame mixer initialization failed: {e}", file=sys.stderr)
 

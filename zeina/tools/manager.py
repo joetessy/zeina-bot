@@ -1,6 +1,7 @@
 """Tool framework — Tool dataclass, ToolManager, and global instance."""
-from typing import Callable, Dict, Any, List, Optional
+from collections.abc import Collection
 from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional
 
 
 @dataclass
@@ -8,7 +9,7 @@ class Tool:
     """Represents a tool that the LLM can call"""
     name: str
     description: str
-    function: Callable
+    function: Callable[..., Any]
     parameters: Dict[str, Any]
 
     def to_openai_schema(self) -> Dict[str, Any]:
@@ -23,7 +24,7 @@ class Tool:
             }
         }
 
-    def execute(self, **kwargs) -> str:
+    def execute(self, **kwargs: Any) -> str:
         """Execute the tool with given parameters"""
         try:
             result = self.function(**kwargs)
@@ -35,12 +36,14 @@ class Tool:
 class ToolManager:
     """Manages registration and execution of tools"""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.tools: Dict[str, Tool] = {}
 
-    def register(self, name: str, description: str, parameters: Dict[str, Any]):
+    def register(
+        self, name: str, description: str, parameters: Dict[str, Any]
+    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         """Decorator to register a tool"""
-        def decorator(func: Callable) -> Callable:
+        def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
             tool = Tool(
                 name=name,
                 description=description,
@@ -62,9 +65,13 @@ class ToolManager:
             return f"Error: Tool '{name}' not found"
         return tool.execute(**arguments)
 
-    def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        """Get all tools in OpenAI function-calling format."""
-        return [tool.to_openai_schema() for tool in self.tools.values()]
+    def get_tool_schemas(self, exclude: Collection[str] = ()) -> List[Dict[str, Any]]:
+        """Get all tools in OpenAI function-calling format, minus ``exclude``."""
+        return [
+            tool.to_openai_schema()
+            for name, tool in self.tools.items()
+            if name not in exclude
+        ]
 
     def has_tools(self) -> bool:
         """Check if any tools are registered"""

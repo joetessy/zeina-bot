@@ -17,11 +17,12 @@ from __future__ import annotations
 
 import json
 import threading
-from typing import Any, Iterator, Optional
+from typing import Any, Iterator, Optional, Union
 
 from openai import OpenAI
 
 from zeina import config
+from zeina.types import ChatMessage, ToolCall, ToolSchema
 
 _client: Optional[OpenAI] = None
 _client_sig: Optional[tuple] = None
@@ -49,14 +50,14 @@ def get_client() -> OpenAI:
 
 
 def chat(
-    messages: list[dict],
+    messages: list[ChatMessage],
     *,
     model: Optional[str] = None,
-    tools: Optional[list[dict]] = None,
+    tools: Optional[list[ToolSchema]] = None,
     stream: bool = False,
     temperature: Optional[float] = None,
-    response_format: Optional[dict] = None,
-):
+    response_format: Optional[dict[str, Any]] = None,
+) -> Union[Any, Iterator[str]]:
     """Run a chat completion.
 
     Non-streaming: returns the response ``message`` object, which exposes
@@ -94,9 +95,9 @@ def _stream_tokens(client: OpenAI, kwargs: dict) -> Iterator[str]:
             yield token
 
 
-def parse_tool_calls(message) -> list[dict]:
+def parse_tool_calls(message: Any) -> list[ToolCall]:
     """Normalize a message's tool_calls into [{"id", "name", "arguments": dict}]."""
-    out: list[dict] = []
+    out: list[ToolCall] = []
     for tc in (getattr(message, "tool_calls", None) or []):
         raw = tc.function.arguments or "{}"
         try:
@@ -107,7 +108,7 @@ def parse_tool_calls(message) -> list[dict]:
     return out
 
 
-def assistant_tool_call_msg(message) -> dict:
+def assistant_tool_call_msg(message: Any) -> ChatMessage:
     """Serialize an assistant message carrying tool_calls for conversation history.
 
     The OpenAI protocol requires this message to precede the matching ``tool``

@@ -21,8 +21,8 @@ from .manager import tool_manager
     ),
     parameters={"type": "object", "properties": {}, "required": []}
 )
-def get_system_health() -> dict:
-    """Gathers high-level system metrics using psutil and system commands."""
+def get_system_health() -> str:
+    """Gather high-level system metrics and return them as a JSON string."""
     try:
         cpu_usage = psutil.cpu_percent(interval=0.1)
         load_avg = [round(x, 2) for x in psutil.getloadavg()] if hasattr(psutil, "getloadavg") else None
@@ -36,11 +36,7 @@ def get_system_health() -> dict:
         except Exception:
             system_info = platform.platform()
 
-        try:
-            pwd_result = subprocess.run(["pwd"], capture_output=True, text=True, timeout=5)
-            current_directory = pwd_result.stdout.strip() if pwd_result.returncode == 0 else os.getcwd()
-        except Exception:
-            current_directory = os.getcwd()
+        current_directory = os.getcwd()
 
         try:
             uptime_result = subprocess.run(["uptime"], capture_output=True, text=True, timeout=5)
